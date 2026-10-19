@@ -181,7 +181,8 @@ jobs:
             -d CONFIG_MODVERSIONS \
             -d CONFIG_MODULE_SIG \
             -d CONFIG_MODULE_SIG_ALL \
-            -d CONFIG_MODULE_SIG_FORCE || true
+            -d CONFIG_MODULE_SIG_FORCE \
+            --set-str CONFIG_LOCALVERSION "" || true
 
           make -j$(nproc) O="${O}" ${VER_ARGS} olddefconfig
           make -j$(nproc) O="${O}" ${VER_ARGS} prepare
