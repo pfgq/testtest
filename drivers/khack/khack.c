@@ -77,7 +77,7 @@ static int __init khack_init(void)
 {
 	int ret;
 
-	pr_info("khack: vermagic = " VERMAGIC_STRING "\n");
+	pr_info("khack: uts release = " UTS_RELEASE "\n");
 
 	ret = misc_register(&khack_dev);
 	if (ret) {
