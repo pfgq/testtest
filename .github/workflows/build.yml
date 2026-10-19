@@ -1,0 +1,205 @@
+name: Build khack (lmi 4.19.113)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      TZ: Asia/Tokyo
+      CCACHE_DIR: /home/runner/.cache/ccache_mikernel
+      TOOLCHAIN_DIR: /home/runner/zyc-clang
+      TOOLCHAIN_BIN: /home/runner/zyc-clang/bin
+
+      TARGET_DEVICE: lmi
+      BUILD_VARIANT: khack
+
+      # Must match `uname -r` on the phone exactly, otherwise insmod fails
+      # with "invalid module format".
+      STOCK_RELEASE: "4.19.113-perf-gec90c723c482"
+      STOCK_LOCALVERSION: "-perf-gec90c723c482"
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          repository: ApartTUSITU/kernel_xiaomi_sm8250_mod
+          ref: android16-aptusitu
+          path: kernel
+          fetch-depth: 1
+          filter: blob:none
+          submodules: false
+          lfs: false
+
+      - name: Checkout module source
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache flex g++ gcc git gperf \
+            libelf-dev libssl-dev lld llvm make ninja-build \
+            openssl pahole python3 python3-pip rsync unzip zip \
+            zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            curl
+
+      - name: Cache zyc-clang toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/zyc-clang
+          key: zyc-clang-15.0.7-20251111-${{ runner.os }}
+
+      - name: Get zyc-clang toolchain (robust)
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          cd /home/runner
+          url="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20251111-release/Clang-15.0.7-20251111.tar.gz"
+          fname="Clang-15.0.7-20251111.tar.gz"
+          wget -q --show-progress "$url" -O "$fname"
+          file "$fname"
+          gzip -t "$fname"
+
+          clang_entry="$(tar -tzf "$fname" | grep -E '(^|/)(bin/clang|bin/clang-[0-9]+|bin/clang\.real)$' | head -n1 || true)"
+          if [ -z "$clang_entry" ]; then
+            echo "ERROR: cannot find clang entry in tar list."
+            tar -tzf "$fname" | head -n 120
+            exit 1
+          fi
+          echo "Found clang entry: $clang_entry"
+
+          rm -rf /home/runner/zyc-tmp
+          mkdir -p /home/runner/zyc-tmp
+          tar -xzf "$fname" -C /home/runner/zyc-tmp
+
+          root_subdir="$(echo "$clang_entry" | sed -E 's#(^|/)?bin/clang([./-].*)?$##')"
+          root_subdir="${root_subdir%/}"
+          if [ -z "$root_subdir" ]; then
+            src_root="/home/runner/zyc-tmp"
+          else
+            src_root="/home/runner/zyc-tmp/$root_subdir"
+          fi
+
+          rm -rf "${TOOLCHAIN_DIR}"
+          mkdir -p "${TOOLCHAIN_DIR}"
+          rsync -a "$src_root"/ "${TOOLCHAIN_DIR}"/
+
+          if [ ! -e "${TOOLCHAIN_BIN}/clang" ]; then
+            alt="$(ls -1 ${TOOLCHAIN_BIN}/clang-* 2>/dev/null | head -n1 || true)"
+            if [ -n "$alt" ]; then
+              ln -sf "$(basename "$alt")" "${TOOLCHAIN_BIN}/clang"
+            fi
+          fi
+
+          "${TOOLCHAIN_BIN}/clang" --version
+
+      - name: Add toolchain to PATH
+        run: |
+          set -euxo pipefail
+          echo "${TOOLCHAIN_BIN}" >> $GITHUB_PATH
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+
+          echo "TARGET_DEVICE=${TARGET_DEVICE}"
+          echo "STOCK_RELEASE=${STOCK_RELEASE}"
+          clang --version || true
+          ccache -s || true
+
+          # 1) qudong injection (read-only use of that repo; never modified)
+          curl -LSs "https://raw.githubusercontent.com/pfgq/qudong/refs/heads/main/kernel/setup.sh" | bash || true
+
+          # 2) our module wins over anything the injection placed there
+          rm -rf drivers/khack
+          cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
+
+          # 3) locate defconfig
+          DEFCONFIG=""
+          for f in \
+            arch/arm64/configs/${TARGET_DEVICE}_defconfig \
+            arch/arm64/configs/vendor/${TARGET_DEVICE}_defconfig \
+            arch/arm64/configs/vendor/xiaomi/${TARGET_DEVICE}_defconfig
+          do
+            if [ -f "$f" ]; then
+              DEFCONFIG="$(basename "$f")"
+              break
+            fi
+          done
+
+          if [ -z "$DEFCONFIG" ]; then
+            DEFCONFIG="$(ls arch/arm64/configs | grep -i ${TARGET_DEVICE} | head -n1 || true)"
+          fi
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "ERROR: defconfig for ${TARGET_DEVICE} not found"
+            ls arch/arm64/configs | sed -n '1,200p'
+            exit 1
+          fi
+
+          echo "Using DEFCONFIG=${DEFCONFIG}"
+
+          export ARCH=arm64
+          export O=out
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          mkdir -p "${O}"
+
+          # LOCALVERSION override makes the module vermagic match the stock
+          # phone kernel instead of this tree's own version string.
+          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" "${DEFCONFIG}"
+          scripts/config --file "${O}/.config" -e CONFIG_KERNEL_HACK || true
+          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" olddefconfig
+          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" prepare
+          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" modules_prepare
+
+          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" M=drivers/khack modules
+
+          rm -rf "${O}/khack_staging"
+          mkdir -p "${O}/khack_staging"
+          find "${O}" -type f -name "*.ko" -path "*/drivers/khack/*" -print -exec cp -f {} "${O}/khack_staging/" \;
+
+      - name: Verify vermagic
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          KO="$(find out/khack_staging -name '*.ko' | head -n1)"
+          if [ -z "${KO}" ]; then
+            echo "ERROR: no .ko produced"
+            exit 1
+          fi
+          ls -l "${KO}"
+          VERMAGIC="$(modinfo -F vermagic "${KO}" || true)"
+          echo "vermagic: ${VERMAGIC}"
+          echo "expected: ${STOCK_RELEASE} SMP preempt mod_unload aarch64"
+          case "${VERMAGIC}" in
+            "${STOCK_RELEASE}"*) echo "OK: release matches" ;;
+            *) echo "WARN: release does not match; module will not load on stock kernel" ;;
+          esac
+          strings "${KO}" | grep -i vermagic || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARGET_DEVICE }}-${{ env.BUILD_VARIANT }}-${{ github.run_number }}
+          path: kernel/out/khack_staging/*
+          if-no-files-found: warn
+          retention-days: 7

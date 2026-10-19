@@ -1,0 +1,10 @@
+config KERNEL_HACK
+	bool "khack root helper"
+	depends on ARM64
+	default n
+	help
+	  Minimal LKM exposing /dev/khack (ioctl) and /proc/khack (write "1")
+	  for credential escalation on 4.19 vendor kernels.
+
+	  The module is normally built out-of-tree with
+	  "make M=drivers/khack modules" and loaded with insmod.
