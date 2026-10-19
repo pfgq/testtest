@@ -77,8 +77,6 @@ static int __init khack_init(void)
 {
 	int ret;
 
-	pr_info("khack: uts release = " UTS_RELEASE "\n");
-
 	ret = misc_register(&khack_dev);
 	if (ret) {
 		pr_err("khack: misc_register failed: %d\n", ret);
