@@ -160,17 +160,34 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
+          # The tree is 4.19.325; the phone runs 4.19.113.  Force the version
+          # triple so the module vermagic can match, and keep setlocalversion
+          # from appending a git suffix.
+          : > .scmversion
+          VER_ARGS="VERSION=4 PATCHLEVEL=19 SUBLEVEL=113 LOCALVERSION=${STOCK_LOCALVERSION}"
+
           mkdir -p "${O}"
 
-          # LOCALVERSION override makes the module vermagic match the stock
-          # phone kernel instead of this tree's own version string.
-          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" "${DEFCONFIG}"
-          scripts/config --file "${O}/.config" -e CONFIG_KERNEL_HACK || true
-          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" olddefconfig
-          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" prepare
-          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" modules_prepare
+          make -j$(nproc) O="${O}" ${VER_ARGS} "${DEFCONFIG}"
 
-          make -j$(nproc) O="${O}" LOCALVERSION="${STOCK_LOCALVERSION}" M=drivers/khack modules
+          # Stock kernel has MODVERSIONS off (no __crc_ in kallsyms) and does
+          # not sign modules; the tree enables both.  Align the module build
+          # with the running kernel, otherwise modpost needs vmlinux CRCs and
+          # the vermagic gains a "modversions" suffix.
+          scripts/config --file "${O}/.config" \
+            -e CONFIG_KERNEL_HACK \
+            -e CONFIG_PREEMPT \
+            -e CONFIG_MODULE_UNLOAD \
+            -d CONFIG_MODVERSIONS \
+            -d CONFIG_MODULE_SIG \
+            -d CONFIG_MODULE_SIG_ALL \
+            -d CONFIG_MODULE_SIG_FORCE || true
+
+          make -j$(nproc) O="${O}" ${VER_ARGS} olddefconfig
+          make -j$(nproc) O="${O}" ${VER_ARGS} prepare
+          make -j$(nproc) O="${O}" ${VER_ARGS} modules_prepare
+
+          make -j$(nproc) O="${O}" ${VER_ARGS} M=drivers/khack modules
 
           rm -rf "${O}/khack_staging"
           mkdir -p "${O}/khack_staging"
