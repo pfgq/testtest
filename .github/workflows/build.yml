@@ -199,7 +199,20 @@ jobs:
             -d CONFIG_TOUCHSCREEN_ST_I2C \
             -d CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE \
             -d CONFIG_MI_RECLAIM \
-            -d CONFIG_QTI_MAXIM_FAN_CONTROLLER || true
+            -d CONFIG_QTI_MAXIM_FAN_CONTROLLER \
+            -d CONFIG_QPNP_SMB5 \
+            -d CONFIG_QPNP_FG_GEN3 \
+            -d CONFIG_QPNP_FG_GEN4 \
+            -d CONFIG_QPNP_QG \
+            -d CONFIG_QPNP_QNOVO5 \
+            -d CONFIG_SMB1398_CHARGER \
+            -d CONFIG_SMB1398_COMBO_CHARGE_PSY \
+            -d CONFIG_IDT_P9415 \
+            -d CONFIG_RX1619 \
+            -d CONFIG_RX1619_TRIM \
+            -d CONFIG_LN8282 \
+            -d CONFIG_HL6111R \
+            -d CONFIG_FUEL_GAUGE_BQ27Z561 || true
 
           set +e
           TOOL_ARGS="CC=/home/runner/clangwrap/clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf"
