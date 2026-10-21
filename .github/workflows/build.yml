@@ -178,15 +178,16 @@ jobs:
             -e CONFIG_MODVERSIONS || true
 
           set +e
-          ( make -j$(nproc) O="${O}" ${VER_ARGS} CC=clang olddefconfig ) 2>&1 | tee build.log
+          TOOL_ARGS="CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf"
+          ( make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} olddefconfig ) 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
           if [ ${rc} -eq 0 ]; then
             # Module.symvers CRCs only exist after a vmlinux link.
-            ( make -j$(nproc) O="${O}" ${VER_ARGS} CC=clang vmlinux ) 2>&1 | tee -a build.log
+            ( make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} vmlinux ) 2>&1 | tee -a build.log
             rc=${PIPESTATUS[0]}
           fi
           if [ ${rc} -eq 0 ]; then
-            ( make -j$(nproc) O="${O}" ${VER_ARGS} CC=clang M=drivers/khack modules ) 2>&1 | tee -a build.log
+            ( make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} M=drivers/khack modules ) 2>&1 | tee -a build.log
             rc=${PIPESTATUS[0]}
           fi
           cp build.log "${GITHUB_WORKSPACE}/build.log"
