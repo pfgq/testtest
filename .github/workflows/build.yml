@@ -120,10 +120,7 @@ jobs:
           clang --version || true
           ccache -s || true
 
-          # 1) qudong injection (read-only use of that repo; never modified)
-          curl -LSs "https://raw.githubusercontent.com/pfgq/qudong/refs/heads/main/kernel/setup.sh" | bash || true
-
-          # 2) our module wins over anything the injection placed there
+          # 1) our module wins over anything already in the tree
           rm -rf drivers/khack
           cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
 
@@ -170,15 +167,14 @@ jobs:
 
           make -j$(nproc) O="${O}" ${VER_ARGS} "${DEFCONFIG}"
 
-          # Stock kernel has MODVERSIONS off (no __crc_ in kallsyms) and does
-          # not sign modules; the tree enables both.  Align the module build
-          # with the running kernel, otherwise modpost needs vmlinux CRCs and
-          # the vermagic gains a "modversions" suffix.
+          # The phone runs CONFIG_MODVERSIONS=y (checked in /proc/config.gz), so
+          # the module must carry __versions CRCs and a "modversions" vermagic.
+          # Signing stays off: MODULE_SIG_FORCE is not set on the device.
           scripts/config --file "${O}/.config" \
             -e CONFIG_KERNEL_HACK \
             -e CONFIG_PREEMPT \
             -e CONFIG_MODULE_UNLOAD \
-            -d CONFIG_MODVERSIONS \
+            -e CONFIG_MODVERSIONS \
             -d CONFIG_MODULE_SIG \
             -d CONFIG_MODULE_SIG_ALL \
             -d CONFIG_MODULE_SIG_FORCE \
@@ -187,6 +183,10 @@ jobs:
           make -j$(nproc) O="${O}" ${VER_ARGS} olddefconfig
           make -j$(nproc) O="${O}" ${VER_ARGS} prepare
           make -j$(nproc) O="${O}" ${VER_ARGS} modules_prepare
+
+          # MODVERSIONS needs CRCs from Module.symvers, and only a vmlinux link
+          # produces it. modules_prepare alone leaves the CRCs empty.
+          make -j$(nproc) O="${O}" ${VER_ARGS} vmlinux
 
           make -j$(nproc) O="${O}" ${VER_ARGS} M=drivers/khack modules
 
@@ -206,12 +206,13 @@ jobs:
           ls -l "${KO}"
           VERMAGIC="$(modinfo -F vermagic "${KO}" || true)"
           echo "vermagic: ${VERMAGIC}"
-          echo "expected: ${STOCK_RELEASE} SMP preempt mod_unload aarch64"
+          echo "expected: ${STOCK_RELEASE} SMP preempt mod_unload modversions aarch64"
           case "${VERMAGIC}" in
-            "${STOCK_RELEASE}"*) echo "OK: release matches" ;;
-            *) echo "WARN: release does not match; module will not load on stock kernel" ;;
+            "${STOCK_RELEASE}"*modversions*) echo "OK: release + modversions" ;;
+            *) echo "WARN: vermagic mismatch" ;;
           esac
-          strings "${KO}" | grep -i vermagic || true
+          echo "--- __versions section ---"
+          readelf -S "${KO}" | grep -iE "versions" || echo "MISSING __versions"
 
       - name: Upload artifacts
         if: always()
