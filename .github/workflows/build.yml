@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     env:
       TZ: Asia/Tokyo
@@ -222,3 +222,14 @@ jobs:
           path: kernel/out/khack_staging/*
           if-no-files-found: warn
           retention-days: 7
+
+      # Artifact downloads need a token even on a public repo, so publish the
+      # same file as a release asset: that URL is fetchable without auth.
+      - name: Publish .ko as release asset
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: khack-ci
+          name: khack CI build
+          prerelease: true
+          files: kernel/out/khack_staging/*.ko
