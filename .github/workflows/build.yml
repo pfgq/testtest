@@ -110,6 +110,16 @@ jobs:
           set -euxo pipefail
           echo "${TOOLCHAIN_BIN}" >> $GITHUB_PATH
 
+      # The tree builds with -no-integrated-as and relies on clang's --prefix
+      # to find the GNU assembler; clang 15 ignores --prefix, so it picks the
+      # toolchain's own `as` (llvm-as) and dies on -EL. Put GNU as in its place.
+      - name: Point the toolchain at GNU as
+        run: |
+          set -euxo pipefail
+          ls -l /usr/bin/aarch64-linux-gnu-as
+          ln -sf /usr/bin/aarch64-linux-gnu-as "${TOOLCHAIN_BIN}/as"
+          "${TOOLCHAIN_BIN}/as" --version | head -n1
+
       - name: Build
         working-directory: kernel
         run: |
@@ -123,11 +133,6 @@ jobs:
           # 1) our module wins over anything already in the tree
           rm -rf drivers/khack
           cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
-
-          # This tree hardcodes the external GNU assembler and relies on
-          # clang's --prefix=, which clang 15 ignores: it then picks the
-          # toolchain's llvm-as and dies on -EL. Use the integrated assembler.
-          sed -i 's/-no-integrated-as/-fintegrated-as/' Makefile
 
           export ARCH=arm64
           export O=out
