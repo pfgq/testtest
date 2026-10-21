@@ -124,6 +124,11 @@ jobs:
           rm -rf drivers/khack
           cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
 
+          # This tree hardcodes the external GNU assembler and relies on
+          # clang's --prefix=, which clang 15 ignores: it then picks the
+          # toolchain's llvm-as and dies on -EL. Use the integrated assembler.
+          sed -i 's/-no-integrated-as/-fintegrated-as/' Makefile
+
           export ARCH=arm64
           export O=out
           export LLVM=1
