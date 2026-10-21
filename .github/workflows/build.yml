@@ -26,11 +26,11 @@ jobs:
       STOCK_LOCALVERSION: "-perf-gec90c723c482"
 
     steps:
-      - name: Checkout kernel
+      - name: Checkout kernel (4.19.113, LineageOS sm8250)
         uses: actions/checkout@v4
         with:
-          repository: ApartTUSITU/kernel_xiaomi_sm8250_mod
-          ref: android16-aptusitu
+          repository: LineageOS/android_kernel_xiaomi_sm8250
+          ref: lineage-18.1
           path: kernel
           fetch-depth: 1
           filter: blob:none
@@ -124,31 +124,6 @@ jobs:
           rm -rf drivers/khack
           cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
 
-          # 3) locate defconfig
-          DEFCONFIG=""
-          for f in \
-            arch/arm64/configs/${TARGET_DEVICE}_defconfig \
-            arch/arm64/configs/vendor/${TARGET_DEVICE}_defconfig \
-            arch/arm64/configs/vendor/xiaomi/${TARGET_DEVICE}_defconfig
-          do
-            if [ -f "$f" ]; then
-              DEFCONFIG="$(basename "$f")"
-              break
-            fi
-          done
-
-          if [ -z "$DEFCONFIG" ]; then
-            DEFCONFIG="$(ls arch/arm64/configs | grep -i ${TARGET_DEVICE} | head -n1 || true)"
-          fi
-
-          if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: defconfig for ${TARGET_DEVICE} not found"
-            ls arch/arm64/configs | sed -n '1,200p'
-            exit 1
-          fi
-
-          echo "Using DEFCONFIG=${DEFCONFIG}"
-
           export ARCH=arm64
           export O=out
           export LLVM=1
@@ -157,35 +132,27 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
-          # The tree is 4.19.325; the phone runs 4.19.113.  Force the version
-          # triple so the module vermagic can match, and keep setlocalversion
-          # from appending a git suffix.
+          # Keep setlocalversion from appending a git suffix, and force the
+          # release triple the phone reports.
           : > .scmversion
           VER_ARGS="VERSION=4 PATCHLEVEL=19 SUBLEVEL=113 LOCALVERSION=${STOCK_LOCALVERSION}"
 
           mkdir -p "${O}"
 
-          make -j$(nproc) O="${O}" ${VER_ARGS} "${DEFCONFIG}"
+          # The phone's own /proc/config.gz. Struct layouts -- and therefore
+          # every symbol CRC -- follow this config, not the tree's defconfig.
+          cp "${GITHUB_WORKSPACE}/src/lmi-4.19.113.config" "${O}/.config"
 
-          # The phone runs CONFIG_MODVERSIONS=y (checked in /proc/config.gz), so
-          # the module must carry __versions CRCs and a "modversions" vermagic.
-          # Signing stays off: MODULE_SIG_FORCE is not set on the device.
+          # MODULE_SIG stays y (it is y in the phone's config and affects struct
+          # module); only the build-time signing pass is dropped.
           scripts/config --file "${O}/.config" \
-            -e CONFIG_KERNEL_HACK \
-            -e CONFIG_PREEMPT \
-            -e CONFIG_MODULE_UNLOAD \
-            -e CONFIG_MODVERSIONS \
-            -d CONFIG_MODULE_SIG \
             -d CONFIG_MODULE_SIG_ALL \
             -d CONFIG_MODULE_SIG_FORCE \
-            --set-str CONFIG_LOCALVERSION "" || true
+            -e CONFIG_MODVERSIONS || true
 
           make -j$(nproc) O="${O}" ${VER_ARGS} olddefconfig
-          make -j$(nproc) O="${O}" ${VER_ARGS} prepare
-          make -j$(nproc) O="${O}" ${VER_ARGS} modules_prepare
 
-          # MODVERSIONS needs CRCs from Module.symvers, and only a vmlinux link
-          # produces it. modules_prepare alone leaves the CRCs empty.
+          # Module.symvers CRCs only exist after a vmlinux link.
           make -j$(nproc) O="${O}" ${VER_ARGS} vmlinux
 
           make -j$(nproc) O="${O}" ${VER_ARGS} M=drivers/khack modules
