@@ -121,6 +121,12 @@ jobs:
           ln -sf /usr/bin/aarch64-linux-gnu-as /home/runner/gas/as
           ln -sf /usr/bin/aarch64-linux-gnu-as /home/runner/gas/aarch64-linux-gnu-as
           /home/runner/gas/as --version | head -n1
+          # clang may still resolve `as` next to its own binary, so replace the
+          # toolchain's llvm-as with a dispatcher: host gcc passes --64 and must
+          # get x86 as, everything else is the aarch64 assembler.
+          printf '%s\n' '#!/bin/sh' 'for a in "$@"; do case "$a" in --64|-m64|--32) exec /usr/bin/as "$@";; esac; done' 'exec /usr/bin/aarch64-linux-gnu-as "$@"' > "${TOOLCHAIN_BIN}/as"
+          chmod +x "${TOOLCHAIN_BIN}/as"
+          "${TOOLCHAIN_BIN}/as" --version | head -n1
 
       - name: Build
         working-directory: kernel
@@ -138,7 +144,7 @@ jobs:
 
           # clang 15 ignores the --prefix= this tree passes to locate GNU as;
           # point it at our private -B directory instead (target compiles only).
-          perl -0pi -e 's{\t-no-integrated-as}{\t-no-integrated-as\nCLANG_FLAGS\t+= -B/home/runner/gas}' Makefile
+          perl -0pi -e 's{-no-integrated-as}{-no-integrated-as\nCLANG_FLAGS\t+= -B/home/runner/gas}' Makefile
           grep -n "no-integrated-as\|/home/runner/gas" Makefile | head
 
           export ARCH=arm64
