@@ -110,15 +110,17 @@ jobs:
           set -euxo pipefail
           echo "${TOOLCHAIN_BIN}" >> $GITHUB_PATH
 
-      # The tree builds with -no-integrated-as and relies on clang's --prefix
-      # to find the GNU assembler; clang 15 ignores --prefix, so it picks the
-      # toolchain's own `as` (llvm-as) and dies on -EL. Put GNU as in its place.
-      - name: Point the toolchain at GNU as
+      # GNU as lives in /usr/bin, but clang 15 ignores the tree's --prefix= and
+      # then picks the toolchain's own `as` (llvm-as). Give clang a private -B
+      # directory containing only the aarch64 assembler; host gcc is untouched.
+      - name: Prepare GNU as search directory
         run: |
           set -euxo pipefail
           ls -l /usr/bin/aarch64-linux-gnu-as
-          ln -sf /usr/bin/aarch64-linux-gnu-as "${TOOLCHAIN_BIN}/as"
-          "${TOOLCHAIN_BIN}/as" --version | head -n1
+          mkdir -p /home/runner/gas
+          ln -sf /usr/bin/aarch64-linux-gnu-as /home/runner/gas/as
+          ln -sf /usr/bin/aarch64-linux-gnu-as /home/runner/gas/aarch64-linux-gnu-as
+          /home/runner/gas/as --version | head -n1
 
       - name: Build
         working-directory: kernel
@@ -133,6 +135,11 @@ jobs:
           # 1) our module wins over anything already in the tree
           rm -rf drivers/khack
           cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
+
+          # clang 15 ignores the --prefix= this tree passes to locate GNU as;
+          # point it at our private -B directory instead (target compiles only).
+          perl -0pi -e 's{\t-no-integrated-as}{\t-no-integrated-as\nCLANG_FLAGS\t+= -B/home/runner/gas}' Makefile
+          grep -n "no-integrated-as\|/home/runner/gas" Makefile | head
 
           export ARCH=arm64
           export O=out
