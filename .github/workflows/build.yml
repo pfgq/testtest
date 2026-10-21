@@ -189,6 +189,18 @@ jobs:
             -d CONFIG_MODULE_SIG_FORCE \
             -e CONFIG_MODVERSIONS || true
 
+          # The phone's config enables Xiaomi-only drivers whose headers do not
+          # exist in the Lineage tree (ds28e16 battery auth, ST touch, MIUI
+          # reclaim, Maxim fan). None of them feed struct cred/module, so drop
+          # them instead of porting vendor code.
+          scripts/config --file "${O}/.config" \
+            -d CONFIG_BATT_VERIFY_BY_DS28E16 \
+            -d CONFIG_TOUCHSCREEN_ST \
+            -d CONFIG_TOUCHSCREEN_ST_I2C \
+            -d CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE \
+            -d CONFIG_MI_RECLAIM \
+            -d CONFIG_QTI_MAXIM_FAN_CONTROLLER || true
+
           set +e
           TOOL_ARGS="CC=/home/runner/clangwrap/clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf"
           ( make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} olddefconfig ) 2>&1 | tee build.log
