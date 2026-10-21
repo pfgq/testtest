@@ -128,14 +128,15 @@ jobs:
           chmod +x "${TOOLCHAIN_BIN}/as"
           "${TOOLCHAIN_BIN}/as" --version | head -n1
 
-      # clang 15 flags things this 2021 vendor tree treats as fatal (unused
-      # set-but-not-used variables, strict prototypes). Keep the errors real by
-      # appending -Wno-error last, which wins over every earlier -Werror.
+      # clang 15 promotes warnings this 2021 vendor tree never saw (implicit-int,
+      # strict-prototypes, unused-but-set). -Wno-error does not override the
+      # tree's explicit -Werror=<group> flags, so silence warnings outright: -w
+      # is the only form that wins over every -Werror= in the command line.
       - name: Create clang wrapper
         run: |
           set -euxo pipefail
           mkdir -p /home/runner/clangwrap
-          printf '%s\n' '#!/bin/sh' 'exec /home/runner/zyc-clang/bin/clang "$@" -Wno-error' > /home/runner/clangwrap/clang
+          printf '%s\n' '#!/bin/sh' 'exec /home/runner/zyc-clang/bin/clang "$@" -w' > /home/runner/clangwrap/clang
           chmod +x /home/runner/clangwrap/clang
           /home/runner/clangwrap/clang --version | head -n1
 
