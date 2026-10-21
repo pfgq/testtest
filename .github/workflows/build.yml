@@ -150,16 +150,26 @@ jobs:
             -d CONFIG_MODULE_SIG_FORCE \
             -e CONFIG_MODVERSIONS || true
 
-          make -j$(nproc) O="${O}" ${VER_ARGS} olddefconfig
+          set +e
+          ( make -j$(nproc) O="${O}" ${VER_ARGS} olddefconfig ) 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ ${rc} -eq 0 ]; then
+            # Module.symvers CRCs only exist after a vmlinux link.
+            ( make -j$(nproc) O="${O}" ${VER_ARGS} vmlinux ) 2>&1 | tee -a build.log
+            rc=${PIPESTATUS[0]}
+          fi
+          if [ ${rc} -eq 0 ]; then
+            ( make -j$(nproc) O="${O}" ${VER_ARGS} M=drivers/khack modules ) 2>&1 | tee -a build.log
+            rc=${PIPESTATUS[0]}
+          fi
+          cp build.log "${GITHUB_WORKSPACE}/build.log"
 
-          # Module.symvers CRCs only exist after a vmlinux link.
-          make -j$(nproc) O="${O}" ${VER_ARGS} vmlinux
-
-          make -j$(nproc) O="${O}" ${VER_ARGS} M=drivers/khack modules
-
-          rm -rf "${O}/khack_staging"
-          mkdir -p "${O}/khack_staging"
-          find "${O}" -type f -name "*.ko" -path "*/drivers/khack/*" -print -exec cp -f {} "${O}/khack_staging/" \;
+          if [ ${rc} -eq 0 ]; then
+            rm -rf "${O}/khack_staging"
+            mkdir -p "${O}/khack_staging"
+            find "${O}" -type f -name "*.ko" -path "*/drivers/khack/*" -print -exec cp -f {} "${O}/khack_staging/" \;
+          fi
+          exit ${rc}
 
       - name: Verify vermagic
         working-directory: kernel
@@ -180,6 +190,17 @@ jobs:
           esac
           echo "--- __versions section ---"
           readelf -S "${KO}" | grep -iE "versions" || echo "MISSING __versions"
+
+      # A failure is only debuggable if the log is reachable without a token,
+      # so publish it as a release asset too.
+      - name: Publish build log on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: khack-ci-log
+          name: CI build log
+          prerelease: true
+          files: build.log
 
       - name: Upload artifacts
         if: always()
