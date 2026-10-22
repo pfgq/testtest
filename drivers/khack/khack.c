@@ -241,13 +241,13 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 	case KSU_IOCTL_GET_FULL_VERSION: {
 		struct ksu_get_full_version_cmd c;
 		memset(&c, 0, sizeof(c));
-		strncpy(c.version_full, "khack-4.19.113-42000", sizeof(c.version_full) - 1);
+		memcpy(c.version_full, "khack-4.19.113-42000", 20);
 		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
 	}
 	case KSU_IOCTL_HOOK_TYPE: {
 		struct ksu_hook_type_cmd c;
 		memset(&c, 0, sizeof(c));
-		strncpy(c.hook_type, "anon-inode-shim", sizeof(c.hook_type) - 1);
+		memcpy(c.hook_type, "anon-inode-shim", 16);
 		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
 	}
 	case KSU_IOCTL_REPORT_EVENT:
