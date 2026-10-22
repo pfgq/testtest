@@ -68,6 +68,7 @@ static long (*p_orig_reboot)(const struct pt_regs *regs);
 #define KSU_IOCTL_UID_GRANTED_ROOT 0xc0004b08
 #define KSU_IOCTL_UID_SHOULD_UMOUNT 0xc0004b09
 #define KSU_IOCTL_GET_MANAGER_APPID 0x80004b0a
+#define KSU_IOCTL_GET_MANAGERS      0xc0004b69
 #define KSU_IOCTL_GET_APP_PROFILE  0xc0004b0b
 #define KSU_IOCTL_SET_APP_PROFILE  0x40004b0c
 #define KSU_IOCTL_GET_FEATURE      0xc0004b0d
@@ -128,6 +129,18 @@ struct ksu_hook_type_cmd {
 	char hook_type[32];
 };
 
+struct ksu_get_managers_hdr {
+	u16 count;
+	u16 total_count;
+} __attribute__((packed));
+
+struct ksu_get_managers_one {
+	u16 count;
+	u16 total_count;
+	u32 uid;
+	u8 signature_index;
+} __attribute__((packed));
+
 static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -180,8 +193,27 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
 	}
 	case KSU_IOCTL_GET_MANAGER_APPID: {
-		struct ksu_get_manager_appid_cmd c = { .appid = 0 };
+		struct ksu_get_manager_appid_cmd c = { .appid = (u32)current_uid().val };
 		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_GET_MANAGERS: {
+		/* The manager probes with count=0 first, then asks for the entries.
+		 * Report the caller as the one and only active manager. */
+		struct ksu_get_managers_hdr hdr;
+		if (p_copy_from_user(&hdr, uarg, sizeof(hdr)))
+			return -EFAULT;
+		if (hdr.count == 0) {
+			hdr.count = 0;
+			hdr.total_count = 1;
+			return p_copy_to_user(uarg, &hdr, sizeof(hdr)) ? -EFAULT : 0;
+		}
+		struct ksu_get_managers_one one = {
+			.count = 1,
+			.total_count = 1,
+			.uid = (u32)current_uid().val,
+			.signature_index = 0,
+		};
+		return p_copy_to_user(uarg, &one, sizeof(one)) ? -EFAULT : 0;
 	}
 	case KSU_IOCTL_GET_FEATURE: {
 		struct ksu_get_feature_cmd c;
