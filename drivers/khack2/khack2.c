@@ -26,6 +26,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/sched.h>
+#include <linux/cred.h>
 #include <linux/moduleparam.h>
 #include <asm/ptrace.h>
 #include <asm/memory.h>
@@ -39,11 +40,15 @@ typedef int (*anonfd_fn)(const char *name, const struct file_operations *fops,
 #define KSU_INSTALL_MAGIC1 0xDEADBEEF
 #define KSU_INSTALL_MAGIC2 0xCAFEBABE
 #define KSU_SYSCALL_REBOOT 142
+#define KSU_SYSCALL_SETRESUID 147
 
 static unsigned long sct_addr;
 static unsigned long kvoff_addr;
 static unsigned long msa_addr;
+static int mgr_uid;
 module_param(sct_addr, ulong, 0600);
+module_param(mgr_uid, int, 0644);
+MODULE_PARM_DESC(mgr_uid, "uid of the manager app that receives the driver fd");
 module_param(kvoff_addr, ulong, 0600);
 module_param(msa_addr, ulong, 0600);
 MODULE_PARM_DESC(sct_addr, "runtime address of sys_call_table");
@@ -57,6 +62,26 @@ static copy_fn   p_copy_from_user;
 static anonfd_fn p_anon_inode_getfd;
 static const struct file_operations ksu_driver_fops;
 static long (*p_orig_reboot)(const struct pt_regs *regs);
+static long (*p_orig_setresuid)(const struct pt_regs *regs);
+
+/* The real driver hands the manager its driver fd from a setuid hook; the
+ * manager only ever finds the driver by scanning its own fds, so mirror that
+ * here. The fd is deliberately left open (no CLOEXEC). */
+static long khack_setresuid_hook(const struct pt_regs *regs)
+{
+	long ret;
+
+	if (!p_orig_setresuid)
+		return -ENOSYS;
+	ret = p_orig_setresuid(regs);
+	if (ret == 0 && mgr_uid > 0 && (int)current_uid().val == mgr_uid) {
+		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
+					    NULL, O_RDWR);
+		if (fd < 0)
+			pr_info("khack2: manager fd install failed: %d\n", fd);
+	}
+	return ret;
+}
 
 /* ---- KernelSU uapi v4 (uapi/supercall.h) ---- */
 #define KSU_IOCTL_GRANT_ROOT       0x00004b01
@@ -355,6 +380,13 @@ static int __init khack2_init(void)
 				(void *)p_orig_reboot);
 		else
 			pr_err("khack2: sys_call_table patch failed\n");
+
+		entry = sct_addr + KSU_SYSCALL_SETRESUID * sizeof(unsigned long);
+		p_orig_setresuid = (void *)READ_ONCE(*(unsigned long *)entry);
+		if (!khack_write_kernel_ptr(entry, (unsigned long)&khack_setresuid_hook))
+			pr_info("khack2: setresuid hook installed (mgr_uid=%d)\n", mgr_uid);
+		else
+			pr_err("khack2: setresuid patch failed\n");
 	}
 
 	pr_info("khack2: loaded, ksu uapi v4 shim ready\n");
@@ -366,6 +398,10 @@ static void __exit khack2_exit(void)
 	if (sct_addr && p_orig_reboot) {
 		unsigned long entry = sct_addr + KSU_SYSCALL_REBOOT * sizeof(unsigned long);
 		khack_write_kernel_ptr(entry, (unsigned long)p_orig_reboot);
+	}
+	if (sct_addr && p_orig_setresuid) {
+		unsigned long entry = sct_addr + KSU_SYSCALL_SETRESUID * sizeof(unsigned long);
+		khack_write_kernel_ptr(entry, (unsigned long)p_orig_setresuid);
 	}
 	misc_deregister(&khack2_dev);
 }
