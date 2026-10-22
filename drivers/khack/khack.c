@@ -7,11 +7,9 @@
  * layouts differ from this tree and no combination of CRCs will help.
  */
 #include <linux/module.h>
-#include <linux/kernel.h>
 
 static int __init khack_init(void)
 {
-	pr_info("khack: minimal module loaded\n");
 	return 0;
 }
 
