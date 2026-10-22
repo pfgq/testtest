@@ -221,6 +221,15 @@ static int khack_write_kernel_ptr(unsigned long addr, unsigned long val)
 	alias = (void *)(unsigned long)((phys - memstart) | PAGE_OFFSET);
 
 	slot = (unsigned long *)alias;
+
+	/* Safety: the alias must read the same thing the image mapping reads.
+	 * If the phys translation is off we bail instead of corrupting memory. */
+	if (*slot != *(unsigned long *)addr) {
+		pr_err("khack: alias check failed (%px != %px)\n",
+		       (void *)*slot, (void *)*(unsigned long *)addr);
+		return -EINVAL;
+	}
+
 	*slot = val;
 	__asm__ __volatile__("dsb ish" ::: "memory");
 
