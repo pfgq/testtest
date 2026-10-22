@@ -22,6 +22,10 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/types.h>
+#include <linux/moduleparam.h>
+#include <asm/ptrace.h>
+#include <asm/pgtable.h>
+#include <asm/memory.h>
 
 typedef void *(*commit_fn)(void *);
 typedef void *(*prep_fn)(void *);
@@ -29,6 +33,15 @@ typedef unsigned long (*copy_fn)(void *to, const void *from, unsigned long n);
 typedef int (*anonfd_fn)(const char *name, const struct file_operations *fops,
 			 void *priv, int flags);
 
+#define KSU_INSTALL_MAGIC1 0xDEADBEEF
+#define KSU_INSTALL_MAGIC2 0xCAFEBABE
+#define KSU_SYSCALL_REBOOT 142
+
+static unsigned long sct_addr;
+module_param(sct_addr, ulong, 0600);
+MODULE_PARM_DESC(sct_addr, "runtime address of sys_call_table");
+
+static long (*p_orig_reboot)(const struct pt_regs *regs);
 static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
 static copy_fn   p_copy_to_user;
@@ -176,6 +189,86 @@ static int khack_clear_enforcing(void)
 	*(u8 *)(hit + 1) = 0;
 	pr_info("khack: selinux_state at %px, enforcement cleared\n", (void *)hit);
 	return 0;
+}
+
+
+/* ---- sys_call_table patching via the linear alias ----
+ * .rodata is mapped read-only in the image mapping, but the same physical
+ * pages are also reachable through the linear map, which is writable.
+ */
+#if defined(pmd_leaf)
+#define KHACK_PMD_LEAF(p) pmd_leaf(p)
+#elif defined(pmd_sect)
+#define KHACK_PMD_LEAF(p) pmd_sect(p)
+#else
+#define KHACK_PMD_LEAF(p) 0
+#endif
+
+static unsigned long khack_phys_from_virt(unsigned long addr)
+{
+	struct mm_struct *mm = &init_mm;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return 0;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return 0;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return 0;
+#if defined(pud_sect)
+	if (pud_sect(*pud))
+		return (pud_pfn(*pud) << PAGE_SHIFT) + (addr & ~PUD_MASK);
+#endif
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		return 0;
+	if (KHACK_PMD_LEAF(*pmd))
+		return (pmd_pfn(*pmd) << PAGE_SHIFT) + (addr & ~PMD_MASK);
+	pte = pte_offset_kernel(pmd, addr);
+	if (pte_none(*pte))
+		return 0;
+	return (pte_pfn(*pte) << PAGE_SHIFT) + (addr & ~PAGE_MASK);
+}
+
+static int khack_write_kernel_ptr(unsigned long addr, unsigned long val)
+{
+	unsigned long phys = khack_phys_from_virt(addr);
+	void *alias;
+
+	if (!phys)
+		return -EFAULT;
+	alias = __va(phys);
+	*(unsigned long *)alias = val;
+	return 0;
+}
+
+/* reboot(0xDEADBEEF, 0xCAFEBABE, 0, &fd) -> hand out the ksu_driver fd, the
+ * way the real KernelSU driver does, so the manager app finds us. */
+static long khack_reboot_hook(const struct pt_regs *regs)
+{
+	u32 magic1 = (u32)regs->regs[0];
+	u32 magic2 = (u32)regs->regs[1];
+	unsigned long arg = regs->regs[3];
+
+	if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_INSTALL_MAGIC2) {
+		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
+					    NULL, O_RDWR);
+		if (fd < 0)
+			return fd;
+		if (arg && p_copy_to_user((void __user *)arg, &fd, sizeof(fd)))
+			return -EFAULT;
+		return 0;
+	}
+	if (p_orig_reboot)
+		return p_orig_reboot(regs);
+	return -ENOSYS;
 }
 
 static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
@@ -347,6 +440,18 @@ static int __init khack_init(void)
 	if (ret) {
 		pr_err("khack: misc_register failed: %d\n", ret);
 		return ret;
+	}
+
+	/* Install the reboot hook so the manager app can obtain a driver fd. */
+	if (sct_addr) {
+		unsigned long entry = sct_addr + KSU_SYSCALL_REBOOT * sizeof(unsigned long);
+		unsigned long *slot = (unsigned long *)entry;
+		p_orig_reboot = (void *)READ_ONCE(*slot);
+		if (!khack_write_kernel_ptr(entry, (unsigned long)&khack_reboot_hook))
+			pr_info("khack: reboot hook installed (was %px)\n",
+				(void *)p_orig_reboot);
+		else
+			pr_err("khack: sys_call_table patch failed\n");
 	}
 
 	pr_info("khack: loaded, /dev/khack ready (ksu uapi v4 shim)\n");
