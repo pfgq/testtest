@@ -115,8 +115,10 @@ jobs:
           export REAL_CC=clang
           export CROSS_COMPILE=aarch64-linux-gnu-
 
-          : > .scmversion
-          VER_ARGS="VERSION=4 PATCHLEVEL=19 SUBLEVEL=113 LOCALVERSION=${STOCK_LOCALVERSION}"
+          # CONFIG_LOCALVERSION already carries "-perf"; the git suffix goes
+          # through .scmversion so LOCALVERSION must stay empty or it doubles.
+          echo "-gec90c723c482" > .scmversion
+          VER_ARGS="VERSION=4 PATCHLEVEL=19 SUBLEVEL=113 LOCALVERSION="
           TOOL_ARGS="CC=/home/runner/clangwrap/clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf"
 
           # clang 15 ignores the tree's --prefix= for GNU as.
@@ -160,6 +162,7 @@ jobs:
 
           rm -rf "${O}/khack_staging" && mkdir -p "${O}/khack_staging"
           find "${O}" -type f -name "*.ko" -path "*/drivers/khack/*" -print -exec cp -f {} "${O}/khack_staging/" \;
+          find "${O}/khack_staging" -name "*.ko" -exec llvm-strip --strip-debug {} \;
           cp build.log "${GITHUB_WORKSPACE}/build.log"
 
       - name: Verify CRCs + vermagic
