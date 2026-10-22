@@ -2,8 +2,6 @@ name: Build khack (lmi 4.19.113)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "main", "master" ]
 
 jobs:
   build:
