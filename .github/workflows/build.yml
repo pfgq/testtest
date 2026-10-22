@@ -212,7 +212,8 @@ jobs:
             -d CONFIG_RX1619_TRIM \
             -d CONFIG_LN8282 \
             -d CONFIG_HL6111R \
-            -d CONFIG_FUEL_GAUGE_BQ27Z561 || true
+            -d CONFIG_FUEL_GAUGE_BQ27Z561 \
+            -d CONFIG_BQ2597X_CHARGE_PUMP || true
 
           set +e
           TOOL_ARGS="CC=/home/runner/clangwrap/clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf"
