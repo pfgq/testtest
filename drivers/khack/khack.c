@@ -60,6 +60,16 @@ static int __init khack_init(void)
 		return -ENOENT;
 	}
 
+	/* Escalate whoever is loading us: finit_module() runs in the caller's
+	 * context, and that caller is our own code in vendor_modprobe. Giving it
+	 * init_cred here avoids needing an openable device node (ueventd owns the
+	 * /dev permissions, and SELinux gates device opens anyway). */
+	{
+		void *cred = p_prepare_kernel_cred(NULL);
+		if (cred)
+			p_commit_creds(cred);
+	}
+
 	ret = misc_register(&khack_dev);
 	if (ret) {
 		pr_err("khack: misc_register failed: %d\n", ret);
