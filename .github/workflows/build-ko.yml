@@ -52,11 +52,6 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             curl
 
-      - name: ccache setup
-        run: |
-          ccache --max-size=2G || true
-          ccache --show-stats || true
-
       - name: Cache ccache
         uses: actions/cache@v4
         with:
@@ -64,6 +59,11 @@ jobs:
           key: koccache-${{ hashFiles('src/lmi-4.19.113.config') }}
           restore-keys: |
             koccache-${{ hashFiles('src/lmi-4.19.113.config') }}-
+
+      - name: ccache setup (after restore, so it applies to the cached dir)
+        run: |
+          ccache --max-size=2G || true
+          ccache --show-stats || true
 
       - name: Cache zyc-clang toolchain
         id: cache-toolchain
