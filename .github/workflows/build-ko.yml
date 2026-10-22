@@ -40,17 +40,25 @@ jobs:
         with:
           path: src
 
-      - name: Install dependencies
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: apt-${{ runner.os }}-ko-v1
+
+      - name: Install dependencies (cached)
         run: |
           set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache flex g++ gcc git gperf \
-            libelf-dev libssl-dev lld llvm make ninja-build \
-            openssl pahole python3 python3-pip rsync unzip zip \
-            zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            curl
+          PKGS="bc bison ccache flex g++ gcc git gperf libelf-dev libssl-dev lld llvm make ninja-build openssl pahole python3 python3-pip rsync unzip zip zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi curl"
+          if [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null | grep -v lock)" ]; then
+            sudo apt-get update
+          fi
+          sudo apt-get install -y --no-install-recommends ${PKGS} || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ${PKGS}
+          }
 
       - name: Cache ccache
         uses: actions/cache@v4
