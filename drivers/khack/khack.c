@@ -41,6 +41,7 @@ static unsigned long sct_addr;
 module_param(sct_addr, ulong, 0600);
 MODULE_PARM_DESC(sct_addr, "runtime address of sys_call_table");
 
+static const struct file_operations ksu_driver_fops;
 static long (*p_orig_reboot)(const struct pt_regs *regs);
 static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
