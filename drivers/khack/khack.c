@@ -18,6 +18,7 @@ typedef void *(*prep_fn)(void *);
 
 static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
+static unsigned long (*p_kallsyms_lookup_name)(const char *name);
 
 /* open("/dev/khack") -> caller's creds become init_cred (uid 0, kernel SID) */
 static int khack_open(struct inode *inode, struct file *file)
@@ -58,6 +59,21 @@ static int __init khack_init(void)
 		pr_err("khack: __symbol_get failed (%px %px)\n",
 		       p_commit_creds, p_prepare_kernel_cred);
 		return -ENOENT;
+	}
+
+	/* Best case: the vendor kernel still exports kallsyms_lookup_name, which
+	 * lets us find selinux_state and turn enforcement off the way upstream
+	 * dfroot.ko does. Not exported on the Lineage tree, so this is a probe as
+	 * much as a feature. */
+	p_kallsyms_lookup_name = (void *)__symbol_get("kallsyms_lookup_name");
+	if (p_kallsyms_lookup_name) {
+		unsigned long addr = p_kallsyms_lookup_name("selinux_state");
+		if (addr) {
+			*(u8 *)addr = 0;        /* disabled */
+			*(u8 *)(addr + 1) = 0;  /* enforcing */
+			pr_info("khack: selinux_state at %px, enforcement cleared\n",
+				(void *)addr);
+		}
 	}
 
 	/* Escalate whoever is loading us: finit_module() runs in the caller's

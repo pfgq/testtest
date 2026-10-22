@@ -1,2 +1,2 @@
-obj-m += khack4.o
-khack4-y := khack.o
+obj-m += khack5.o
+khack5-y := khack.o
