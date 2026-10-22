@@ -154,6 +154,11 @@ jobs:
           rm -rf drivers/khack
           cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
 
+          # Xiaomi-only objects that reference enums/fields absent from this
+          # tree's headers. Dropping the object keeps the config (and therefore
+          # every struct CRC) untouched, which is what we actually need.
+          sed -i '/ion_camera_heap.o/d' drivers/staging/android/ion/Makefile
+
           # clang 15 ignores the --prefix= this tree passes to locate GNU as;
           # point it at our private -B directory instead (target compiles only).
           perl -0pi -e 's{-no-integrated-as}{-no-integrated-as\nCLANG_FLAGS\t+= -B/home/runner/gas\nCLANG_FLAGS\t+= -fuse-ld=lld}' Makefile
