@@ -137,8 +137,11 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 	case KSU_IOCTL_GET_INFO: {
 		struct ksu_get_info_cmd c = {
 			.version = KSU_VERSION,
-			.flags = 0,
-			.features = 0,
+			/* Pretend to be the registered manager, loaded late: the shim has no
+			 * manager-appid bookkeeping, and late-load mode is how this root is
+			 * actually installed. */
+			.flags = (1U << 1) | (1U << 2),
+			.features = 5,
 			.uapi_version = KSU_UAPI_VERSION,
 		};
 		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
@@ -146,8 +149,8 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 	case KSU_IOCTL_GET_INFO_LEGACY: {
 		struct ksu_get_info_legacy_cmd c = {
 			.version = KSU_VERSION,
-			.flags = 0,
-			.features = 0,
+			.flags = (1U << 1) | (1U << 2),
+			.features = 5,
 		};
 		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
 	}
@@ -184,8 +187,8 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 		struct ksu_get_feature_cmd c;
 		if (p_copy_from_user(&c, uarg, sizeof(c)))
 			return -EFAULT;
-		c.value = 0;
-		c.supported = 0;
+		c.value = 1;
+		c.supported = 1;
 		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
 	}
 	case KSU_IOCTL_GET_FULL_VERSION: {
