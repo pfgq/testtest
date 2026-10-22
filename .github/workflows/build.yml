@@ -54,6 +54,14 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             curl
 
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/ccache_mikernel
+          key: ccache-${{ hashFiles('src/lmi-4.19.113.config') }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-${{ hashFiles('src/lmi-4.19.113.config') }}-
+
       - name: Cache zyc-clang toolchain
         id: cache-toolchain
         uses: actions/cache@v4
@@ -136,7 +144,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p /home/runner/clangwrap
-          printf '%s\n' '#!/bin/sh' 'exec /home/runner/zyc-clang/bin/clang "$@" -w' > /home/runner/clangwrap/clang
+          printf '%s\n' '#!/bin/sh' 'exec ccache /home/runner/zyc-clang/bin/clang "$@" -w' > /home/runner/clangwrap/clang
           chmod +x /home/runner/clangwrap/clang
           /home/runner/clangwrap/clang --version | head -n1
 
