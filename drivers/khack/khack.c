@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /* khack - root LKM for 4.19 vendor kernels, built to survive MODVERSIONS.
  *
- * The vendor kernel's struct cred / task_struct layouts differ from the
- * Lineage tree, so importing commit_creds()/prepare_kernel_cred() directly
- * fails check_version() on their CRCs. Both are EXPORT_SYMBOL'd, so resolve
- * them at runtime with __symbol_get() instead -- its prototype takes only a
- * const char *, so its own CRC is layout independent and matches.
+ * Two jobs:
+ *  1. /dev/khack: open() gives the caller init_cred, ioctl(KHACK_GET_KSU_FD)
+ *     hands out an anon_inode named "[ksu_driver]" that speaks the
+ *     ReSukiSU/KernelSU uapi (ioctl 'K' commands).
+ *  2. The ksu_driver fd itself: enough of the uapi for ksud to recognise a
+ *     driver and for GRANT_ROOT to actually elevate the caller.
+ *
+ * Every external symbol is resolved with __symbol_get(), so the only imports
+ * are module_layout/printk/misc_register/misc_deregister/__symbol_get - the
+ * same set whose vendor CRCs we already know match this kernel.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -15,29 +20,112 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/string.h>
+#include <linux/sched.h>
+#include <linux/types.h>
 
 typedef void *(*commit_fn)(void *);
 typedef void *(*prep_fn)(void *);
+typedef unsigned long (*copy_fn)(void *to, const void *from, unsigned long n);
+typedef int (*anonfd_fn)(const char *name, const struct file_operations *fops,
+			 void *priv, int flags);
 
 static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
-static unsigned long (*p_kallsyms_lookup_name)(const char *name);
-typedef long (*pkr_fn)(void *dst, const void *src, size_t count);
+static copy_fn   p_copy_to_user;
+static copy_fn   p_copy_from_user;
+static anonfd_fn p_anon_inode_getfd;
 
-/* Locate struct selinux_state without kallsyms_lookup_name.
- *
- * Layout on this tree (CONFIG_SECURITY_SELINUX_DISABLE=n, DEVELOP=y):
+/* ---- ReSukiSU / KernelSU uapi (uapi/supercall.h, uapi version 4) ---- */
+#define KSU_IOCTL_GRANT_ROOT       0x00004b01
+#define KSU_IOCTL_GET_INFO         0x80104b02
+#define KSU_IOCTL_GET_INFO_LEGACY  0x80004b02
+#define KSU_IOCTL_REPORT_EVENT     0x40004b03
+#define KSU_IOCTL_SET_SEPOLICY     0xc0004b04
+#define KSU_IOCTL_CHECK_SAFEMODE   0x80004b05
+#define KSU_IOCTL_UID_GRANTED_ROOT 0xc0004b08
+#define KSU_IOCTL_UID_SHOULD_UMOUNT 0xc00004b09
+#define KSU_IOCTL_GET_MANAGER_APPID 0x80004b0a
+#define KSU_IOCTL_GET_APP_PROFILE  0xc0004b0b
+#define KSU_IOCTL_SET_APP_PROFILE  0x40004b0c
+#define KSU_IOCTL_GET_FEATURE      0xc0004b0d
+#define KSU_IOCTL_SET_FEATURE      0x40004b0e
+#define KSU_IOCTL_GET_WRAPPER_FD   0x40004b0f
+#define KSU_IOCTL_MANAGE_MARK      0xc0004b10
+#define KSU_IOCTL_ADD_TRY_UMOUNT   0x40004b12
+#define KSU_IOCTL_GET_SULOG_FD     0x40104b14
+#define KSU_IOCTL_GET_FULL_VERSION 0x80004b64
+#define KSU_IOCTL_HOOK_TYPE        0x80004b65
+
+/* private: ask /dev/khack for a ksu_driver fd */
+#define KHACK_GET_KSU_FD           0x00004b00
+
+#define KSU_VERSION                42000
+#define KSU_UAPI_VERSION           4
+
+struct ksu_get_info_cmd {
+	u32 version;
+	u32 flags;
+	u32 features;
+	u32 uapi_version;
+};
+
+struct ksu_get_info_legacy_cmd {
+	u32 version;
+	u32 flags;
+	u32 features;
+};
+
+struct ksu_check_safemode_cmd {
+	u8 in_safe_mode;
+};
+
+struct ksu_uid_granted_root_cmd {
+	u32 uid;
+	u8 granted;
+};
+
+struct ksu_uid_should_umount_cmd {
+	u32 uid;
+	u8 should_umount;
+};
+
+struct ksu_get_manager_appid_cmd {
+	u32 appid;
+};
+
+struct ksu_get_feature_cmd {
+	u32 feature_id;
+	u64 value;
+	u8 supported;
+};
+
+struct ksu_manage_mark_cmd {
+	u32 operation;
+	s32 pid;
+	u32 result;
+};
+
+struct ksu_get_full_version_cmd {
+	char version_full[255];
+};
+
+struct ksu_hook_type_cmd {
+	char hook_type[32];
+};
+
+
+/* ---- locate struct selinux_state without kallsyms_lookup_name ----
+ * Layout (SELINUX_DISABLE=n, DEVELOP=y):
  *   +0 disabled(0) +1 enforcing(1) +2 checkreqprot(0) +3 initialized(1)
  *   +4..+15 policycap[8] + android_netlink_route, all 0/1
  *   +16 avc pointer, +24 ss pointer
- * A booted enforcing system therefore has the exact byte signature
- * 00 01 00 01 followed by twelve bytes <= 1 and two in-image pointers.
- * probe_kernel_read() keeps the walk safe over holes. Only a single
- * unambiguous hit is acted on; anything else is left alone.
+ * A booted enforcing system has exactly 00 01 00 01 then twelve bytes <= 1
+ * and two aligned in-image pointers. Only a single unambiguous hit is acted
+ * on; anything else is left alone.
  */
 static int khack_clear_enforcing(void)
 {
-	pkr_fn pkr = (pkr_fn)__symbol_get("probe_kernel_read");
+	copy_fn pkr = (copy_fn)__symbol_get("probe_kernel_read");
 	unsigned long anchor = (unsigned long)__symbol_get("printk");
 	unsigned long lo, hi, a, hit = 0;
 	static u8 buf[4096];
@@ -85,10 +173,100 @@ static int khack_clear_enforcing(void)
 		return -ENOENT;
 	}
 
-	*(u8 *)(hit + 1) = 0;	/* enforcing = false */
+	*(u8 *)(hit + 1) = 0;
 	pr_info("khack: selinux_state at %px, enforcement cleared\n", (void *)hit);
 	return 0;
 }
+
+static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg)
+{
+	void __user *uarg = (void __user *)arg;
+
+	switch (cmd) {
+	case KSU_IOCTL_GET_INFO: {
+		struct ksu_get_info_cmd c = {
+			.version = KSU_VERSION,
+			.flags = 0,
+			.features = 0,
+			.uapi_version = KSU_UAPI_VERSION,
+		};
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_GET_INFO_LEGACY: {
+		struct ksu_get_info_legacy_cmd c = {
+			.version = KSU_VERSION,
+			.flags = 0,
+			.features = 0,
+		};
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_GRANT_ROOT: {
+		void *cred = p_prepare_kernel_cred(NULL);
+		if (!cred)
+			return -ENOMEM;
+		p_commit_creds(cred);
+		return 0;
+	}
+	case KSU_IOCTL_CHECK_SAFEMODE: {
+		struct ksu_check_safemode_cmd c = { .in_safe_mode = 0 };
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_UID_GRANTED_ROOT: {
+		struct ksu_uid_granted_root_cmd c;
+		if (p_copy_from_user(&c, uarg, sizeof(c)))
+			return -EFAULT;
+		c.granted = 1;
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_UID_SHOULD_UMOUNT: {
+		struct ksu_uid_should_umount_cmd c;
+		if (p_copy_from_user(&c, uarg, sizeof(c)))
+			return -EFAULT;
+		c.should_umount = 0;
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_GET_MANAGER_APPID: {
+		struct ksu_get_manager_appid_cmd c = { .appid = 0 };
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_GET_FEATURE: {
+		struct ksu_get_feature_cmd c;
+		if (p_copy_from_user(&c, uarg, sizeof(c)))
+			return -EFAULT;
+		c.value = 0;
+		c.supported = 0;
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_GET_FULL_VERSION: {
+		struct ksu_get_full_version_cmd c;
+		memset(&c, 0, sizeof(c));
+		strncpy(c.version_full, "khack-4.19.113-42000", sizeof(c.version_full) - 1);
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_HOOK_TYPE: {
+		struct ksu_hook_type_cmd c;
+		memset(&c, 0, sizeof(c));
+		strncpy(c.hook_type, "anon-inode-shim", sizeof(c.hook_type) - 1);
+		return p_copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+	}
+	case KSU_IOCTL_REPORT_EVENT:
+	case KSU_IOCTL_SET_FEATURE:
+	case KSU_IOCTL_MANAGE_MARK:
+	case KSU_IOCTL_ADD_TRY_UMOUNT:
+	case KSU_IOCTL_SET_SEPOLICY:
+	case KSU_IOCTL_SET_APP_PROFILE:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static const struct file_operations ksu_driver_fops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = ksu_driver_ioctl,
+	.compat_ioctl = ksu_driver_ioctl,
+};
 
 /* open("/dev/khack") -> caller's creds become init_cred (uid 0, kernel SID) */
 static int khack_open(struct inode *inode, struct file *file)
@@ -107,9 +285,23 @@ static int khack_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/* ioctl(KHACK_GET_KSU_FD) -> anon_inode fd named "anon_inode:[ksu_driver]" */
+static long khack_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	if (cmd == KHACK_GET_KSU_FD) {
+		if (!p_anon_inode_getfd)
+			return -ENOSYS;
+		return p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
+					  NULL, O_RDWR);
+	}
+	return -EINVAL;
+}
+
 static const struct file_operations khack_fops = {
 	.owner = THIS_MODULE,
 	.open  = khack_open,
+	.unlocked_ioctl = khack_ioctl,
+	.compat_ioctl = khack_ioctl,
 };
 
 static struct miscdevice khack_dev = {
@@ -131,29 +323,20 @@ static int __init khack_init(void)
 		return -ENOENT;
 	}
 
-	/* Best case: the vendor kernel still exports kallsyms_lookup_name, which
-	 * lets us find selinux_state and turn enforcement off the way upstream
-	 * dfroot.ko does. Not exported on the Lineage tree, so this is a probe as
-	 * much as a feature. */
-	p_kallsyms_lookup_name = (void *)__symbol_get("kallsyms_lookup_name");
-	if (p_kallsyms_lookup_name) {
-		unsigned long addr = p_kallsyms_lookup_name("selinux_state");
-		if (addr) {
-			*(u8 *)addr = 0;        /* disabled */
-			*(u8 *)(addr + 1) = 0;  /* enforcing */
-			pr_info("khack: selinux_state at %px, enforcement cleared\n",
-				(void *)addr);
-		}
+	p_copy_to_user   = (copy_fn)__symbol_get("__arch_copy_to_user");
+	p_copy_from_user = (copy_fn)__symbol_get("__arch_copy_from_user");
+	p_anon_inode_getfd = (anonfd_fn)__symbol_get("anon_inode_getfd");
+	if (!p_copy_to_user || !p_copy_from_user || !p_anon_inode_getfd) {
+		pr_err("khack: uapi helpers missing (%px %px %px)\n",
+		       p_copy_to_user, p_copy_from_user, p_anon_inode_getfd);
+		return -ENOENT;
 	}
 
-	/* Fall back to a memory scan when the symbol is not exported. */
-	if (!p_kallsyms_lookup_name)
-		khack_clear_enforcing();
+	/* SELinux permissive first: everything after this stops being gated. */
+	khack_clear_enforcing();
 
 	/* Escalate whoever is loading us: finit_module() runs in the caller's
-	 * context, and that caller is our own code in vendor_modprobe. Giving it
-	 * init_cred here avoids needing an openable device node (ueventd owns the
-	 * /dev permissions, and SELinux gates device opens anyway). */
+	 * context, and that caller is our own code in vendor_modprobe. */
 	{
 		void *cred = p_prepare_kernel_cred(NULL);
 		if (cred)
@@ -166,7 +349,7 @@ static int __init khack_init(void)
 		return ret;
 	}
 
-	pr_info("khack: loaded, open /dev/khack to escalate\n");
+	pr_info("khack: loaded, /dev/khack ready (ksu uapi v4 shim)\n");
 	return 0;
 }
 
@@ -179,4 +362,4 @@ module_init(khack_init);
 module_exit(khack_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("khack root helper (runtime symbol resolution)");
+MODULE_DESCRIPTION("khack root helper + minimal KernelSU uapi shim");
