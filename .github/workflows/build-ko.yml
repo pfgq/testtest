@@ -134,7 +134,7 @@ jobs:
 
           # Everything khack.ko imports, and nothing else. genksyms runs as part
           # of each object's compile, so the CRCs land in __crc_* symbols.
-          OBJS="kernel/cred.o kernel/module.o kernel/kallsyms.o kernel/printk/printk.o drivers/char/misc.o"
+          OBJS="kernel/cred.o kernel/module.o kernel/kallsyms.o kernel/printk/printk.o drivers/char/misc.o kernel/params.o"
           for o in ${OBJS}; do
             make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} "${o}" 2>&1 | tee -a build.log
           done

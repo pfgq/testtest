@@ -38,8 +38,14 @@ typedef int (*anonfd_fn)(const char *name, const struct file_operations *fops,
 #define KSU_SYSCALL_REBOOT 142
 
 static unsigned long sct_addr;
+static unsigned long kvoff_addr;
+static unsigned long msa_addr;
 module_param(sct_addr, ulong, 0600);
+module_param(kvoff_addr, ulong, 0600);
+module_param(msa_addr, ulong, 0600);
 MODULE_PARM_DESC(sct_addr, "runtime address of sys_call_table");
+MODULE_PARM_DESC(kvoff_addr, "runtime address of kimage_voffset");
+MODULE_PARM_DESC(msa_addr, "runtime address of memstart_addr");
 
 static const struct file_operations ksu_driver_fops;
 static long (*p_orig_reboot)(const struct pt_regs *regs);
@@ -195,59 +201,30 @@ static int khack_clear_enforcing(void)
 
 /* ---- sys_call_table patching via the linear alias ----
  * .rodata is mapped read-only in the image mapping, but the same physical
- * pages are also reachable through the linear map, which is writable.
+ * pages are reachable through the linear map, which is writable. The image
+ * VA -> phys conversion uses the running kernel's own kimage_voffset, and
+ * phys -> linear VA uses memstart_addr, both read from their symbol
+ * addresses (passed in by userspace, since neither is exported here).
  */
-#if defined(pmd_leaf)
-#define KHACK_PMD_LEAF(p) pmd_leaf(p)
-#elif defined(pmd_sect)
-#define KHACK_PMD_LEAF(p) pmd_sect(p)
-#else
-#define KHACK_PMD_LEAF(p) 0
-#endif
-
-static unsigned long khack_phys_from_virt(unsigned long addr)
-{
-	struct mm_struct *mm = &init_mm;
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-
-	pgd = pgd_offset(mm, addr);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return 0;
-	p4d = p4d_offset(pgd, addr);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
-		return 0;
-	pud = pud_offset(p4d, addr);
-	if (pud_none(*pud) || pud_bad(*pud))
-		return 0;
-#if defined(pud_sect)
-	if (pud_sect(*pud))
-		return (pud_pfn(*pud) << PAGE_SHIFT) + (addr & ~PUD_MASK);
-#endif
-	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd) || pmd_bad(*pmd))
-		return 0;
-	if (KHACK_PMD_LEAF(*pmd))
-		return (pmd_pfn(*pmd) << PAGE_SHIFT) + (addr & ~PMD_MASK);
-	pte = pte_offset_kernel(pmd, addr);
-	if (pte_none(*pte))
-		return 0;
-	return (pte_pfn(*pte) << PAGE_SHIFT) + (addr & ~PAGE_MASK);
-}
-
 static int khack_write_kernel_ptr(unsigned long addr, unsigned long val)
 {
-	unsigned long phys = khack_phys_from_virt(addr);
+	u64 kimage_voffset, memstart, phys;
 	void *alias;
+	unsigned long *slot;
 
-	if (!phys)
-		return -EFAULT;
-	alias = __va(phys);
-	*(unsigned long *)alias = val;
-	return 0;
+	if (!kvoff_addr || !msa_addr || !sct_addr)
+		return -EINVAL;
+
+	kimage_voffset = *(u64 *)kvoff_addr;
+	memstart = *(u64 *)msa_addr;
+	phys = (u64)addr - kimage_voffset;
+	alias = (void *)(unsigned long)((phys - memstart) | PAGE_OFFSET);
+
+	slot = (unsigned long *)alias;
+	*slot = val;
+	__asm__ __volatile__("dsb ish" ::: "memory");
+
+	return (*slot == val) ? 0 : -EIO;
 }
 
 /* reboot(0xDEADBEEF, 0xCAFEBABE, 0, &fd) -> hand out the ksu_driver fd, the

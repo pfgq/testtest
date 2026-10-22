@@ -1,3 +1,3 @@
-obj-m += khack8.o
-khack8-y := khack.o
+obj-m += khack9.o
+khack9-y := khack.o
 ccflags-y += -fno-stack-protector
