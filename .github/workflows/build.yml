@@ -165,6 +165,13 @@ jobs:
           # every struct CRC) untouched, which is what we actually need.
           sed -i '/ion_camera_heap.o/d' drivers/staging/android/ion/Makefile
 
+          # techpack/ is Xiaomi's out-of-tree display/audio/camera stack and is
+          # built unconditionally (drivers-y). It carries many struct fields
+          # this tree's headers lack. We need vmlinux + Module.symvers, not a
+          # working panel, so drop the whole directory.
+          perl -0pi -e 's{drivers-y\t:= drivers/ sound/ firmware/ techpack/}{drivers-y\t:= drivers/ sound/ firmware/}' Makefile
+          grep -n "^drivers-y" Makefile
+
           # clang 15 ignores the --prefix= this tree passes to locate GNU as;
           # point it at our private -B directory instead (target compiles only).
           perl -0pi -e 's{-no-integrated-as}{-no-integrated-as\nCLANG_FLAGS\t+= -B/home/runner/gas\nCLANG_FLAGS\t+= -fuse-ld=lld}' Makefile
