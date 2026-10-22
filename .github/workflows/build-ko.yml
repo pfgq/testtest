@@ -1,0 +1,207 @@
+name: Build khack.ko (targeted, no vmlinux)
+
+# No vmlinux, no drivers, no techpack: only the objects that export the
+# symbols khack.ko imports get compiled, and their genksyms CRCs are lifted
+# straight out of the resulting .o files. Same CRCs as a full vmlinux build,
+# ~4 minutes instead of ~40.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      TZ: Asia/Tokyo
+      CCACHE_DIR: /home/runner/.cache/ccache_mikernel
+      TOOLCHAIN_DIR: /home/runner/zyc-clang
+      TOOLCHAIN_BIN: /home/runner/zyc-clang/bin
+
+      TARGET_DEVICE: lmi
+      BUILD_VARIANT: khack
+
+      STOCK_RELEASE: "4.19.113-perf-gec90c723c482"
+      STOCK_LOCALVERSION: "-perf-gec90c723c482"
+
+    steps:
+      - name: Checkout kernel (4.19.113, LineageOS sm8250)
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_xiaomi_sm8250
+          ref: lineage-18.1
+          path: kernel
+          fetch-depth: 1
+
+      - name: Checkout module source
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache flex g++ gcc git gperf \
+            libelf-dev libssl-dev lld llvm make ninja-build \
+            openssl pahole python3 python3-pip rsync unzip zip \
+            zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            curl
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/ccache_mikernel
+          key: koccache-${{ hashFiles('src/lmi-4.19.113.config') }}-${{ github.run_number }}
+          restore-keys: |
+            koccache-${{ hashFiles('src/lmi-4.19.113.config') }}-
+
+      - name: Cache zyc-clang toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/zyc-clang
+          key: zyc-clang-15.0.7-20251111-${{ runner.os }}
+
+      - name: Get zyc-clang toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          cd /home/runner
+          url="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20251111-release/Clang-15.0.7-20251111.tar.gz"
+          fname="Clang-15.0.7-20251111.tar.gz"
+          wget -q "$url" -O "$fname"
+          gzip -t "$fname"
+          clang_entry="$(tar -tzf "$fname" | grep -E '(^|/)(bin/clang|bin/clang-[0-9]+|bin/clang\.real)$' | head -n1)"
+          rm -rf /home/runner/zyc-tmp && mkdir -p /home/runner/zyc-tmp
+          tar -xzf "$fname" -C /home/runner/zyc-tmp
+          root_subdir="$(echo "$clang_entry" | sed -E 's#(^|/)?bin/clang([./-].*)?$##')"
+          root_subdir="${root_subdir%/}"
+          src_root="/home/runner/zyc-tmp${root_subdir:+/$root_subdir}"
+          rm -rf "${TOOLCHAIN_DIR}" && mkdir -p "${TOOLCHAIN_DIR}"
+          rsync -a "$src_root"/ "${TOOLCHAIN_DIR}"/
+          [ -e "${TOOLCHAIN_BIN}/clang" ] || ln -sf "$(basename "$(ls -1 ${TOOLCHAIN_BIN}/clang-* | head -n1)")" "${TOOLCHAIN_BIN}/clang"
+          "${TOOLCHAIN_BIN}/clang" --version
+
+      - name: Add toolchain to PATH
+        run: echo "${TOOLCHAIN_BIN}" >> $GITHUB_PATH
+
+      - name: Prepare GNU as + clang wrapper
+        run: |
+          set -euxo pipefail
+          mkdir -p /home/runner/gas
+          ln -sf /usr/bin/aarch64-linux-gnu-as /home/runner/gas/as
+          ln -sf /usr/bin/aarch64-linux-gnu-as /home/runner/gas/aarch64-linux-gnu-as
+          printf '%s\n' '#!/bin/sh' 'for a in "$@"; do case "$a" in --64|-m64|--32) exec /usr/bin/as "$@";; esac; done' 'exec /usr/bin/aarch64-linux-gnu-as "$@"' > "${TOOLCHAIN_BIN}/as"
+          chmod +x "${TOOLCHAIN_BIN}/as"
+          mkdir -p /home/runner/clangwrap
+          printf '%s\n' '#!/bin/sh' 'exec ccache /home/runner/zyc-clang/bin/clang "$@" -w' > /home/runner/clangwrap/clang
+          chmod +x /home/runner/clangwrap/clang
+          /home/runner/clangwrap/clang --version | head -n1
+
+      - name: Build exporting objects and harvest CRCs
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          export ARCH=arm64
+          export O=out
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export REAL_CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          : > .scmversion
+          VER_ARGS="VERSION=4 PATCHLEVEL=19 SUBLEVEL=113 LOCALVERSION=${STOCK_LOCALVERSION}"
+          TOOL_ARGS="CC=/home/runner/clangwrap/clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf"
+
+          # clang 15 ignores the tree's --prefix= for GNU as.
+          perl -0pi -e 's{-no-integrated-as}{-no-integrated-as\nCLANG_FLAGS\t+= -B/home/runner/gas\nCLANG_FLAGS\t+= -fuse-ld=lld}' Makefile
+
+          mkdir -p "${O}"
+          cp "${GITHUB_WORKSPACE}/src/lmi-4.19.113.config" "${O}/.config"
+          scripts/config --file "${O}/.config" -d CONFIG_MODULE_SIG_ALL -d CONFIG_MODULE_SIG_FORCE -e CONFIG_MODVERSIONS
+
+          # 1) resolve the config, 2) build the generated headers + scripts
+          make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} olddefconfig 2>&1 | tee build.log
+          make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} prepare 2>&1 | tee -a build.log
+
+          # Everything khack.ko imports, and nothing else. genksyms runs as part
+          # of each object's compile, so the CRCs land in __crc_* symbols.
+          OBJS="kernel/cred.o kernel/module.o kernel/kallsyms.o kernel/printk/printk.o drivers/char/misc.o"
+          for o in ${OBJS}; do
+            make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} "${o}" 2>&1 | tee -a build.log
+          done
+
+          : > Module.symvers
+          for o in ${OBJS}; do
+            for f in "${O}/${o}" "${O}/${o%.o}.symversions"; do
+              [ -f "$f" ] || continue
+              case "$f" in
+                *.symversions) sed -E 's/^(0x[0-9a-fA-F]+)[[:space:]]+([A-Za-z0-9_]+)$/\1\t\2\tvmlinux\tEXPORT_SYMBOL/' "$f" >> Module.symvers ;;
+                *) llvm-nm --defined-only "$f" | awk '$3 ~ /^__crc_/ {n=$3; sub(/^__crc_/,"",n); print "0x"$1"\t"n"\tvmlinux\tEXPORT_SYMBOL"}' >> Module.symvers ;;
+              esac
+            done
+          done
+          # de-dup: last writer wins, keep it simple
+          awk '!seen[$2]++' Module.symvers > m.tmp && mv m.tmp Module.symvers
+          echo "--- harvested CRCs ---"
+          cat Module.symvers
+          cp Module.symvers "${O}/Module.symvers"
+
+          # 3) the module itself, resolved against our hand-built symbol table
+          rm -rf drivers/khack
+          cp -r "${GITHUB_WORKSPACE}/src/drivers/khack" drivers/khack
+          make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} M=drivers/khack modules 2>&1 | tee -a build.log
+
+          rm -rf "${O}/khack_staging" && mkdir -p "${O}/khack_staging"
+          find "${O}" -type f -name "*.ko" -path "*/drivers/khack/*" -print -exec cp -f {} "${O}/khack_staging/" \;
+          cp build.log "${GITHUB_WORKSPACE}/build.log"
+
+      - name: Verify CRCs + vermagic
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          KO="$(find out/khack_staging -name '*.ko' | head -n1)"
+          [ -n "${KO}" ] || { echo "ERROR: no .ko produced"; exit 1; }
+          ls -l "${KO}"
+          echo "vermagic: $(modinfo -F vermagic "${KO}" || true)"
+          echo "--- __versions ---"
+          readelf -p .modinfo "${KO}" | grep -i vermagic || true
+          llvm-objdump -s -j __versions "${KO}" | head -40 || true
+          if llvm-objdump -s -j __versions "${KO}" | grep -qE "00000000 00000000"; then
+            echo "WARN: at least one symbol got CRC 0 (not found in Module.symvers)"
+          fi
+
+      - name: Publish build log on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: khack-ci-log
+          name: CI build log
+          prerelease: true
+          files: build.log
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARGET_DEVICE }}-${{ env.BUILD_VARIANT }}-targeted-${{ github.run_number }}
+          path: |
+            kernel/out/khack_staging/*
+            kernel/Module.symvers
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Publish .ko as release asset
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: khack-ci
+          name: khack CI build
+          prerelease: true
+          files: kernel/out/khack_staging/*.ko
