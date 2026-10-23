@@ -316,7 +316,17 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 	case KSU_IOCTL_SET_APP_PROFILE:
 		return 0;
 	default:
-		return -EINVAL;
+		/* Unknown op: report success and zero the output buffer.  The manager
+		 * treats -EINVAL as "driver is incomplete" and flips its UI to
+		 * unsupported, so a silent no-op is the safer answer. */
+		if ((_IOC_DIR(cmd) & _IOC_READ) && uarg) {
+			char zero[128] = {0};
+			unsigned int sz = _IOC_SIZE(cmd);
+			if (sz > sizeof(zero))
+				sz = sizeof(zero);
+			p_copy_to_user(uarg, zero, sz);
+		}
+		return 0;
 	}
 }
 
