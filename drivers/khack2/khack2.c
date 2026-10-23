@@ -177,7 +177,9 @@ struct tp_find {
 static void tp_find_cb(void *tp, void *priv)
 {
 	struct tp_find *f = priv;
-	const char *name = *(const char **)((char *)tp + sizeof(void *));
+	/* struct tracepoint { const char *name; struct static_key key; ... } -
+	 * name is the FIRST member, reading further dereferences static_key. */
+	const char *name = *(const char **)tp;
 
 	if (!f->found && name && !strcmp(name, "sys_enter"))
 		f->found = tp;
