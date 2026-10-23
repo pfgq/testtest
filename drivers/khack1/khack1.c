@@ -145,6 +145,24 @@ static int __init khack_init(void)
 	}
 
 	pr_info("khack1: loaded, open /dev/khack to escalate\n");
+
+	/* Start the su gatekeeper from init context: nothing else can bring a
+	 * root daemon up without an already-rooted caller. */
+	{
+		typedef int (*umh_fn)(char *path, char **argv, char **envp, int wait);
+		umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
+
+		if (umh) {
+			static char *argv[] = { "/system/bin/sh",
+						"/data/local/tmp/dfroot_boot.sh", NULL };
+			static char *envp[] = { "PATH=/system/bin:/system/xbin",
+						"HOME=/", NULL };
+			umh("/system/bin/sh", argv, envp, 1);
+			pr_info("khack1: started dfroot_boot.sh\n");
+		} else {
+			pr_info("khack1: call_usermodehelper unavailable\n");
+		}
+	}
 	return 0;
 }
 
