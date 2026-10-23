@@ -144,6 +144,7 @@ static int __init khack_init(void)
 		return ret;
 	}
 
+	pr_info("khack1: BUILD 2026-10-24-umh pid=%d\n", current->pid);
 	pr_info("khack1: loaded, open /dev/khack to escalate\n");
 
 	/* Start the su gatekeeper from init context: nothing else can bring a
@@ -153,12 +154,25 @@ static int __init khack_init(void)
 		umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
 
 		if (umh) {
-			static char *argv[] = { "/system/bin/sh",
-						"/data/local/tmp/dfroot_boot.sh", NULL };
+			static char *sh = "/system/bin/sh";
 			static char *envp[] = { "PATH=/system/bin:/system/xbin",
 						"HOME=/", NULL };
-			umh("/system/bin/sh", argv, envp, 1);
-			pr_info("khack1: started dfroot_boot.sh\n");
+			static char *scripts[] = {
+				"/data/local/tmp/dfroot_boot.sh",
+				"/data/data/df.root/files/dfroot_boot.sh",
+			};
+			int i, rc = -1;
+
+			for (i = 0; i < 2; i++) {
+				static char *argv[3];
+				argv[0] = sh;
+				argv[1] = scripts[i];
+				argv[2] = NULL;
+				rc = umh(sh, argv, envp, 1);
+				pr_info("khack1: umh %s -> %d\n", scripts[i], rc);
+				if (!rc)
+					break;
+			}
 		} else {
 			pr_info("khack1: call_usermodehelper unavailable\n");
 		}
