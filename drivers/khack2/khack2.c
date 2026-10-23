@@ -193,6 +193,41 @@ static void *p_tp_sys_enter;
  * upstream driver uses.  Nothing here writes kernel text, so STRICT_KERNEL_RWX
  * does not matter and there is no way to fault on a read-only page. */
 #define KSU_PRCTL_OPTION 0xDEADBEEFu
+#define KSU_MAX_ALLOW 64
+
+static int allow_uids[KSU_MAX_ALLOW];
+static int allow_cnt;
+static DEFINE_SPINLOCK(allow_lock);
+
+static bool allow_has(int uid)
+{
+	int i, hit = 0;
+	spin_lock(&allow_lock);
+	for (i = 0; i < allow_cnt; i++)
+		if (allow_uids[i] == uid) { hit = 1; break; }
+	spin_unlock(&allow_lock);
+	return hit;
+}
+
+static void allow_add(int uid)
+{
+	spin_lock(&allow_lock);
+	if (!allow_has(uid) && allow_cnt < KSU_MAX_ALLOW)
+		allow_uids[allow_cnt++] = uid;
+	spin_unlock(&allow_lock);
+}
+
+static void allow_del(int uid)
+{
+	int i;
+	spin_lock(&allow_lock);
+	for (i = 0; i < allow_cnt; i++)
+		if (allow_uids[i] == uid) {
+			allow_uids[i] = allow_uids[--allow_cnt];
+			break;
+		}
+	spin_unlock(&allow_lock);
+}
 
 static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 {
@@ -208,10 +243,38 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 		int magic = KSU_PRCTL_OPTION;
 
 		switch (cmd) {
-		case 0: { /* CMD_GRANT_ROOT */
-			void *cred = p_prepare_kernel_cred(NULL);
-			if (cred)
-				p_commit_creds(cred);
+		case 0: { /* CMD_GRANT_ROOT: only for allowed uids */
+			int uid = (int)current_uid().val;
+			if (allow_has(uid)) {
+				void *cred = p_prepare_kernel_cred(NULL);
+				if (cred)
+					p_commit_creds(cred);
+			} else {
+				magic = -13; /* -EACCES */
+			}
+			break;
+		}
+		case 3: { /* CMD_ALLOW_SU */
+			int uid = 0;
+			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+				allow_add(uid);
+			break;
+		}
+		case 4: { /* CMD_DENY_SU */
+			int uid = 0;
+			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+				allow_del(uid);
+			break;
+		}
+		case 5: { /* CMD_GET_ALLOW_LIST */
+			u32 n;
+			spin_lock(&allow_lock);
+			n = allow_cnt;
+			if (a1)
+				p_copy_to_user(a1, &n, sizeof(n));
+			if (a2 && n)
+				p_copy_to_user(a2, allow_uids, n * sizeof(int));
+			spin_unlock(&allow_lock);
 			break;
 		}
 		case 2: { /* CMD_GET_VERSION */
