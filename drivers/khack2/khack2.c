@@ -192,9 +192,56 @@ static void *p_tp_sys_enter;
  * number in x8 and the arguments still in x0..x5 - the same mechanism the
  * upstream driver uses.  Nothing here writes kernel text, so STRICT_KERNEL_RWX
  * does not matter and there is no way to fault on a read-only page. */
+#define KSU_PRCTL_OPTION 0xDEADBEEFu
+
 static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 {
 	unsigned long nr = regs->regs[8];
+
+	/* KernelSU v0.9.5 protocol: prctl(0xDEADBEEF, cmd, a1, a2, &result).
+	 * prctl is allowed by the app seccomp filter, unlike reboot(). */
+	if (nr == 167 && (u32)regs->regs[0] == KSU_PRCTL_OPTION) {
+		int cmd = (int)regs->regs[1];
+		void __user *a1 = (void __user *)regs->regs[2];
+		void __user *a2 = (void __user *)regs->regs[3];
+		void __user *res = (void __user *)regs->regs[4];
+		int magic = KSU_PRCTL_OPTION;
+
+		switch (cmd) {
+		case 0: { /* CMD_GRANT_ROOT */
+			void *cred = p_prepare_kernel_cred(NULL);
+			if (cred)
+				p_commit_creds(cred);
+			break;
+		}
+		case 2: { /* CMD_GET_VERSION */
+			int ver = KSU_VERSION, fl = (1 << 1);
+			if (a1)
+				p_copy_to_user(a1, &ver, sizeof(ver));
+			if (a2)
+				p_copy_to_user(a2, &fl, sizeof(fl));
+			break;
+		}
+		case 12: { /* CMD_UID_GRANTED_ROOT */
+			u8 granted = 1;
+			if (a2)
+				p_copy_to_user(a2, &granted, sizeof(granted));
+			break;
+		}
+		case 13: { /* CMD_UID_SHOULD_UMOUNT */
+			u8 um = 0;
+			if (a2)
+				p_copy_to_user(a2, &um, sizeof(um));
+			break;
+		}
+		default:
+			break;
+		}
+		if (res)
+			p_copy_to_user(res, &magic, sizeof(magic));
+		regs->regs[0] = (unsigned long)-1;   /* prctl returns -1 on success */
+		return;
+	}
 
 	if (nr == 142 /* reboot */ &&
 	    (u32)regs->regs[0] == KSU_INSTALL_MAGIC1 &&
