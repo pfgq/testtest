@@ -166,6 +166,37 @@ struct ksu_get_managers_one {
 	u8 signature_index;
 } __attribute__((packed));
 
+typedef int (*tp_reg_fn)(void *tp, void *probe, void *data);
+
+static tp_reg_fn p_tp_register;
+static void *p_tp_sys_enter;
+
+/* raw_syscalls:sys_enter fires before the syscall runs, with the syscall
+ * number in x8 and the arguments still in x0..x5 - the same mechanism the
+ * upstream driver uses.  Nothing here writes kernel text, so STRICT_KERNEL_RWX
+ * does not matter and there is no way to fault on a read-only page. */
+static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
+{
+	unsigned long nr = regs->regs[8];
+
+	if (nr == 142 /* reboot */ &&
+	    (u32)regs->regs[0] == KSU_INSTALL_MAGIC1 &&
+	    (u32)regs->regs[1] == KSU_INSTALL_MAGIC2) {
+		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
+					    NULL, O_RDWR);
+		if (fd >= 0 && regs->regs[3])
+			p_copy_to_user((void __user *)regs->regs[3], &fd, sizeof(fd));
+		regs->regs[0] = 0;
+		return;
+	}
+	if (nr == 147 /* setresuid */ && mgr_uid > 0 &&
+	    (int)current_uid().val == mgr_uid) {
+		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
+					    NULL, O_RDWR);
+		(void)fd;
+	}
+}
+
 static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -372,21 +403,14 @@ static int __init khack2_init(void)
 		return ret;
 	}
 
-	if (sct_addr) {
-		unsigned long entry = sct_addr + KSU_SYSCALL_REBOOT * sizeof(unsigned long);
-		p_orig_reboot = (void *)READ_ONCE(*(unsigned long *)entry);
-		if (!khack_write_kernel_ptr(entry, (unsigned long)&khack_reboot_hook))
-			pr_info("khack2: reboot hook installed (was %px)\n",
-				(void *)p_orig_reboot);
-		else
-			pr_err("khack2: sys_call_table patch failed\n");
-
-		entry = sct_addr + KSU_SYSCALL_SETRESUID * sizeof(unsigned long);
-		p_orig_setresuid = (void *)READ_ONCE(*(unsigned long *)entry);
-		if (!khack_write_kernel_ptr(entry, (unsigned long)&khack_setresuid_hook))
-			pr_info("khack2: setresuid hook installed (mgr_uid=%d)\n", mgr_uid);
-		else
-			pr_err("khack2: setresuid patch failed\n");
+	p_tp_register = (tp_reg_fn)__symbol_get("tracepoint_probe_register");
+	p_tp_sys_enter = __symbol_get("__tracepoint_sys_enter");
+	if (p_tp_register && p_tp_sys_enter) {
+		int r = p_tp_register(p_tp_sys_enter, (void *)ksu_sys_enter_probe, NULL);
+		pr_info("khack2: sys_enter tracepoint hook rc=%d (mgr_uid=%d)\n", r, mgr_uid);
+	} else {
+		pr_info("khack2: tracepoint symbols unavailable (%px %px)\n",
+			p_tp_register, p_tp_sys_enter);
 	}
 
 	pr_info("khack2: loaded, ksu uapi v4 shim ready\n");
@@ -395,14 +419,6 @@ static int __init khack2_init(void)
 
 static void __exit khack2_exit(void)
 {
-	if (sct_addr && p_orig_reboot) {
-		unsigned long entry = sct_addr + KSU_SYSCALL_REBOOT * sizeof(unsigned long);
-		khack_write_kernel_ptr(entry, (unsigned long)p_orig_reboot);
-	}
-	if (sct_addr && p_orig_setresuid) {
-		unsigned long entry = sct_addr + KSU_SYSCALL_SETRESUID * sizeof(unsigned long);
-		khack_write_kernel_ptr(entry, (unsigned long)p_orig_setresuid);
-	}
 	misc_deregister(&khack2_dev);
 }
 
