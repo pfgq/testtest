@@ -167,6 +167,21 @@ struct ksu_get_managers_one {
 } __attribute__((packed));
 
 typedef int (*tp_reg_fn)(void *tp, void *probe, void *data);
+typedef void (*tp_iter_fn)(void (*fct)(void *tp, void *priv), void *priv);
+
+struct tp_find {
+	void *found;
+};
+
+/* __tracepoint_sys_enter is not exported; walk the tracepoint list instead. */
+static void tp_find_cb(void *tp, void *priv)
+{
+	struct tp_find *f = priv;
+	const char *name = *(const char **)((char *)tp + sizeof(void *));
+
+	if (!f->found && name && !strcmp(name, "sys_enter"))
+		f->found = tp;
+}
 
 static tp_reg_fn p_tp_register;
 static void *p_tp_sys_enter;
@@ -404,7 +419,14 @@ static int __init khack2_init(void)
 	}
 
 	p_tp_register = (tp_reg_fn)__symbol_get("tracepoint_probe_register");
-	p_tp_sys_enter = __symbol_get("__tracepoint_sys_enter");
+	{
+		tp_iter_fn iter = (tp_iter_fn)__symbol_get("for_each_kernel_tracepoint");
+		struct tp_find f = { NULL };
+		if (iter) {
+			iter(tp_find_cb, &f);
+			p_tp_sys_enter = f.found;
+		}
+	}
 	if (p_tp_register && p_tp_sys_enter) {
 		int r = p_tp_register(p_tp_sys_enter, (void *)ksu_sys_enter_probe, NULL);
 		pr_info("khack2: sys_enter tracepoint hook rc=%d (mgr_uid=%d)\n", r, mgr_uid);
