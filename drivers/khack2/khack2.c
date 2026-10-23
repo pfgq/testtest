@@ -211,8 +211,12 @@ static bool allow_has(int uid)
 
 static void allow_add(int uid)
 {
+	int i, dup = 0;
+
 	spin_lock(&allow_lock);
-	if (!allow_has(uid) && allow_cnt < KSU_MAX_ALLOW)
+	for (i = 0; i < allow_cnt; i++)
+		if (allow_uids[i] == uid) { dup = 1; break; }
+	if (!dup && allow_cnt < KSU_MAX_ALLOW)
 		allow_uids[allow_cnt++] = uid;
 	spin_unlock(&allow_lock);
 }
@@ -266,15 +270,18 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 				allow_del(uid);
 			break;
 		}
-		case 5: { /* CMD_GET_ALLOW_LIST */
-			u32 n;
+		case 5: { /* CMD_GET_ALLOW_LIST: snapshot first, copy outside the lock */
+			int snap[KSU_MAX_ALLOW];
+			u32 n = 0;
+
 			spin_lock(&allow_lock);
 			n = allow_cnt;
+			memcpy(snap, allow_uids, n * sizeof(int));
+			spin_unlock(&allow_lock);
 			if (a1)
 				p_copy_to_user(a1, &n, sizeof(n));
 			if (a2 && n)
-				p_copy_to_user(a2, allow_uids, n * sizeof(int));
-			spin_unlock(&allow_lock);
+				p_copy_to_user(a2, snap, n * sizeof(int));
 			break;
 		}
 		case 2: { /* CMD_GET_VERSION */
