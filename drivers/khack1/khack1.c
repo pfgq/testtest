@@ -298,7 +298,7 @@ static const struct file_operations khack_fops = {
 
 static struct miscdevice khack_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
-	.name  = "khack",
+	.name  = "ddd",
 	.fops  = &khack_fops,
 	.mode  = 0666,
 };
@@ -336,7 +336,7 @@ static int __init khack_init(void)
 		}
 	}
 	pr_info("khack1: BUILD 2026-10-24-umh pid=%d\n", current->pid);
-	pr_info("khack1: loaded, open /dev/khack to escalate\n");
+	pr_info("khack1: loaded, open /dev/ddd to escalate\n");
 
 	/* Start the su gatekeeper from init context: nothing else can bring a
 	 * root daemon up without an already-rooted caller. */
