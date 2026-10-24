@@ -1,0 +1,112 @@
+name: Build ReSukiSU module (lmi 4.19)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      TZ: Asia/Tokyo
+      TOOLCHAIN_DIR: /home/runner/zyc-clang
+      TOOLCHAIN_BIN: /home/runner/zyc-clang/bin
+      TARGET_DEVICE: lmi
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          repository: ApartTUSITU/kernel_xiaomi_sm8250_mod
+          ref: android16-aptusitu
+          fetch-depth: 1
+          filter: blob:none
+          submodules: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential flex g++ gcc git gperf \
+            libelf-dev libssl-dev lld llvm make ninja-build \
+            openssl pahole python3 python3-pip rsync unzip zip \
+            zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi curl
+
+      - name: Get clang toolchain
+        run: |
+          set -euxo pipefail
+          cd /home/runner
+          url="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20251111-release/Clang-15.0.7-20251111.tar.gz"
+          wget -q "$url" -O clang.tar.gz
+          mkdir -p zyc-tmp && tar -xzf clang.tar.gz -C zyc-tmp
+          rm -rf "${TOOLCHAIN_DIR}" && mkdir -p "${TOOLCHAIN_DIR}"
+          src="$(find zyc-tmp -maxdepth 2 -type d -name bin | head -n1)"
+          rsync -a "$(dirname "$src")"/ "${TOOLCHAIN_DIR}"/
+          "${TOOLCHAIN_BIN}/clang" --version
+
+      - name: Fetch ReSukiSU kernel module
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/Baka-SU/BakaSU /tmp/BakaSU
+          rm -rf drivers/kernelsu
+          cp -r /tmp/BakaSU/kernel drivers/kernelsu
+          grep -q 'kernelsu' drivers/Makefile || \
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'kernelsu/Kconfig' drivers/Kconfig || \
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          # 4.19 vendor kernels are not GKI: manual hook is the only mode that
+          # works here (no tracepoint syscall redirect, no kprobes on this ABI).
+          sed -i 's/^config KSU_MANUAL_HOOK/config KSU_MANUAL_HOOK\n\tdefault y/' drivers/kernelsu/Kconfig || true
+          ls drivers/kernelsu | head
+
+      - name: Configure
+        run: |
+          set -euxo pipefail
+          export PATH="${TOOLCHAIN_BIN}:$PATH"
+          DEFCONFIG=""
+          for f in \
+            arch/arm64/configs/${TARGET_DEVICE}_defconfig \
+            arch/arm64/configs/vendor/${TARGET_DEVICE}_defconfig \
+            arch/arm64/configs/vendor/xiaomi/${TARGET_DEVICE}_defconfig
+          do
+            [ -f "$f" ] && DEFCONFIG="$(basename "$f")" && break
+          done
+          echo "defconfig=$DEFCONFIG"
+          make O=out ARCH=arm64 "$DEFCONFIG"
+          scripts/config --file out/.config \
+            -e CONFIG_KSU \
+            -e CONFIG_KSU_MANUAL_HOOK \
+            -d CONFIG_KSU_KPROBES_HOOK \
+            -d CONFIG_KSU_TRACEPOINT_HOOK || true
+          make O=out ARCH=arm64 olddefconfig
+          grep -E 'CONFIG_KSU' out/.config
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          export PATH="${TOOLCHAIN_BIN}:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 CC=clang \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            modules 2>&1 | tail -40
+
+      - name: Collect module
+        run: |
+          set -euxo pipefail
+          find out -name 'kernelsu.ko' -o -name '*.ko' | grep -i kernelsu || true
+          KO="$(find out -name 'kernelsu.ko' | head -n1)"
+          cp "$KO" ./kernelsu-4.19.113.ko
+          ls -l ./kernelsu-4.19.113.ko
+          strings ./kernelsu-4.19.113.ko | grep vermagic
+
+      - name: Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ksu-ci
+          files: kernelsu-4.19.113.ko
