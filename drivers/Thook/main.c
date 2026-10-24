@@ -16,7 +16,7 @@
 #include "memory.h"
 #include "process.h"
 
-#define THOOK_LOG_ENABLE 0   // 0为关闭，1为开启
+#define THOOK_LOG_ENABLE 1   // 0为关闭，1为开启
 
 #define THOOK_LOG(fmt, ...) \
     do { if (THOOK_LOG_ENABLE) printk(KERN_INFO "[Thook] " fmt, ##__VA_ARGS__); } while (0)
