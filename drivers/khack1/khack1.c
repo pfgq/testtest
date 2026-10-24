@@ -114,7 +114,7 @@ static void khack_drop_seccomp(void)
 }
 
 static unsigned long klname_addr;
-module_param(klname_addr, ulong, 0444);
+module_param(klname_addr, ulong, 0644);
 MODULE_PARM_DESC(klname_addr, "address of kallsyms_lookup_name from /proc/kallsyms");
 
 typedef unsigned long (*klname_fn)(const char *);
