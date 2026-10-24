@@ -237,6 +237,11 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 {
 	unsigned long nr = regs->regs[8];
 
+	/* copy_to_user is not exported on every vendor kernel; without it every
+	 * prctl answer would be a NULL call from the tracepoint. */
+	if (unlikely(!p_copy_to_user))
+		return;
+
 	/* KernelSU v0.9.5 protocol: prctl(0xDEADBEEF, cmd, a1, a2, &result).
 	 * prctl is allowed by the app seccomp filter, unlike reboot(). */
 	if (nr == 167 && (u32)regs->regs[0] == KSU_PRCTL_OPTION) {
