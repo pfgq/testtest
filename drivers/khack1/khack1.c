@@ -21,6 +21,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/sched.h>
+#include <linux/cred.h>
 
 typedef void *(*commit_fn)(void *);
 typedef void *(*prep_fn)(void *);
@@ -206,7 +207,7 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 
 		switch (cmd) {
 		case 0: { /* CMD_GRANT_ROOT: only for allowed uids */
-			int uid = (int)__kuid_val(current_uid());
+			int uid = (int)current_uid().val;
 			if (allow_has(uid)) {
 				void *cred = p_prepare_kernel_cred(NULL);
 				if (cred)
