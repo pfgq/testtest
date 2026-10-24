@@ -107,8 +107,10 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += BakaSU/kernel/' >> drivers/Makefile
           grep -q 'BakaSU/kernel/Kconfig' drivers/Kconfig || \
             sed -i '/^endmenu/i source "drivers/BakaSU/kernel/Kconfig"' drivers/Kconfig
-          # Apply BakaSU's manual-hook call sites to the kernel sources
-          # (fs/exec.c, fs/open.c, fs/stat.c, kernel/reboot.c).
+          # 1) remove any pre-existing KernelSU integration (vendor trees
+          #    ship an old one that conflicts with this module)
+          python3 cisrc/ci/ksu_strip_old.py . || true
+          # 2) install BakaSU's manual-hook call sites
           python3 cisrc/ci/ksu_hooks.py .
           ls drivers/BakaSU | head
 
