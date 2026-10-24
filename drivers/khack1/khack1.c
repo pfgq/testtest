@@ -119,6 +119,173 @@ static void khack_spawn_daemon(void)
 	}
 }
 
+
+/* ---- KernelSU v0.9.5 prctl shim (merged from khack2) ------------------ */
+typedef unsigned long (*copy_fn)(void __user *to, const void *from, unsigned long n);
+static copy_fn p_copy_to_user;
+typedef int (*tp_reg_fn)(void *tp, void *probe, void *data);
+
+struct tp_find { void *found; };
+
+/* struct tracepoint { const char *name; struct static_key key; ... } - the
+ * name is the first member. */
+static void tp_find_cb(void *tp, void *priv)
+{
+	struct tp_find *f = priv;
+	const char *name = *(const char **)tp;
+
+	if (!f->found && name && !strcmp(name, "sys_enter"))
+		f->found = tp;
+}
+
+static struct tracepoint *ksu_find_sys_enter(void *iter_fn)
+{
+	typedef void (*iter_t)(void (*)(void *, void *), void *);
+	struct tp_find f = { NULL };
+
+	if (iter_fn)
+		((iter_t)iter_fn)(tp_find_cb, &f);
+	return (struct tracepoint *)f.found;
+}
+#define KSU_PRCTL_OPTION 0xDEADBEEFu
+#define KSU_MAX_ALLOW 64
+
+static int allow_uids[KSU_MAX_ALLOW];
+static int allow_cnt;
+static DEFINE_SPINLOCK(allow_lock);
+
+static bool allow_has(int uid)
+{
+	int i, hit = 0;
+	spin_lock(&allow_lock);
+	for (i = 0; i < allow_cnt; i++)
+		if (allow_uids[i] == uid) { hit = 1; break; }
+	spin_unlock(&allow_lock);
+	return hit;
+}
+
+static void allow_add(int uid)
+{
+	int i, dup = 0;
+
+	spin_lock(&allow_lock);
+	for (i = 0; i < allow_cnt; i++)
+		if (allow_uids[i] == uid) { dup = 1; break; }
+	if (!dup && allow_cnt < KSU_MAX_ALLOW)
+		allow_uids[allow_cnt++] = uid;
+	spin_unlock(&allow_lock);
+}
+
+static void allow_del(int uid)
+{
+	int i;
+	spin_lock(&allow_lock);
+	for (i = 0; i < allow_cnt; i++)
+		if (allow_uids[i] == uid) {
+			allow_uids[i] = allow_uids[--allow_cnt];
+			break;
+		}
+	spin_unlock(&allow_lock);
+}
+
+static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
+{
+	unsigned long nr = regs->regs[8];
+
+	/* KernelSU v0.9.5 protocol: prctl(0xDEADBEEF, cmd, a1, a2, &result).
+	 * prctl is allowed by the app seccomp filter, unlike reboot(). */
+	if (nr == 167 && (u32)regs->regs[0] == KSU_PRCTL_OPTION) {
+		int cmd = (int)regs->regs[1];
+		void __user *a1 = (void __user *)regs->regs[2];
+		void __user *a2 = (void __user *)regs->regs[3];
+		void __user *res = (void __user *)regs->regs[4];
+		int magic = KSU_PRCTL_OPTION;
+
+		switch (cmd) {
+		case 0: { /* CMD_GRANT_ROOT: only for allowed uids */
+			int uid = (int)current_uid().val;
+			if (allow_has(uid)) {
+				void *cred = p_prepare_kernel_cred(NULL);
+				if (cred)
+					p_commit_creds(cred);
+			} else {
+				magic = -13; /* -EACCES */
+			}
+			break;
+		}
+		case 3: { /* CMD_ALLOW_SU */
+			int uid = 0;
+			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+				allow_add(uid);
+			break;
+		}
+		case 4: { /* CMD_DENY_SU */
+			int uid = 0;
+			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+				allow_del(uid);
+			break;
+		}
+		case 5: { /* CMD_GET_ALLOW_LIST: snapshot first, copy outside the lock */
+			int snap[KSU_MAX_ALLOW];
+			u32 n = 0;
+
+			spin_lock(&allow_lock);
+			n = allow_cnt;
+			memcpy(snap, allow_uids, n * sizeof(int));
+			spin_unlock(&allow_lock);
+			if (a1)
+				p_copy_to_user(a1, &n, sizeof(n));
+			if (a2 && n)
+				p_copy_to_user(a2, snap, n * sizeof(int));
+			break;
+		}
+		case 2: { /* CMD_GET_VERSION */
+			int ver = KSU_VERSION, fl = (1 << 1);
+			if (a1)
+				p_copy_to_user(a1, &ver, sizeof(ver));
+			if (a2)
+				p_copy_to_user(a2, &fl, sizeof(fl));
+			break;
+		}
+		case 12: { /* CMD_UID_GRANTED_ROOT */
+			u8 granted = 1;
+			if (a2)
+				p_copy_to_user(a2, &granted, sizeof(granted));
+			break;
+		}
+		case 13: { /* CMD_UID_SHOULD_UMOUNT */
+			u8 um = 0;
+			if (a2)
+				p_copy_to_user(a2, &um, sizeof(um));
+			break;
+		}
+		default:
+			break;
+		}
+		if (res)
+			p_copy_to_user(res, &magic, sizeof(magic));
+		regs->regs[0] = (unsigned long)-1;   /* prctl returns -1 on success */
+		return;
+	}
+
+	if (nr == 142 /* reboot */ &&
+	    (u32)regs->regs[0] == KSU_INSTALL_MAGIC1 &&
+	    (u32)regs->regs[1] == KSU_INSTALL_MAGIC2) {
+		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
+					    NULL, O_RDWR);
+		if (fd >= 0 && regs->regs[3])
+			p_copy_to_user((void __user *)regs->regs[3], &fd, sizeof(fd));
+		regs->regs[0] = 0;
+		return;
+	}
+	if (nr == 147 /* setresuid */ && mgr_uid > 0 &&
+	    (int)current_uid().val == mgr_uid) {
+		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
+					    NULL, O_RDWR);
+		(void)fd;
+	}
+}
+
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -168,6 +335,18 @@ static int __init khack_init(void)
 		return ret;
 	}
 
+	p_copy_to_user = (copy_fn)__symbol_get("copy_to_user");
+	{
+		tp_reg_fn reg = (tp_reg_fn)__symbol_get("tracepoint_probe_register");
+		void *tpf = (void *)__symbol_get("for_each_kernel_tracepoint");
+		struct tracepoint *tp = ksu_find_sys_enter(tpf);
+		if (reg && tp) {
+			int rc = reg(tp, (void *)ksu_sys_enter_probe, NULL);
+			pr_info("khack1: prctl hook rc=%d\n", rc);
+		} else {
+			pr_info("khack1: tracepoint unavailable (reg=%px tp=%px)\n", reg, tp);
+		}
+	}
 	pr_info("khack1: BUILD 2026-10-24-umh pid=%d\n", current->pid);
 	pr_info("khack1: loaded, open /dev/khack to escalate\n");
 
