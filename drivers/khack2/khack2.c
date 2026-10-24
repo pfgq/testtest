@@ -106,6 +106,8 @@ static long khack_setresuid_hook(const struct pt_regs *regs)
 #define KSU_IOCTL_HOOK_TYPE        0x80004b65
 
 #define KHACK_GET_KSU_FD           0x00004b00
+
+static long khack_load_ko(const char __user *upath);
 #define KSU_VERSION                42000
 #define KSU_UAPI_VERSION           4
 
@@ -578,8 +580,6 @@ static long khack_load_ko(const char __user *upath)
 	pr_info("khack2: load %s -> %d\n", path, ret);
 	return ret;
 }
-
-static long khack_load_ko(const char __user *upath);
 
 static int __init khack2_init(void)
 {
