@@ -167,7 +167,7 @@ jobs:
             cp -r "${GITHUB_WORKSPACE}/src/drivers/$m" "drivers/$m"
             if [ "$m" = "khack2" ] && [ -n "${{ inputs.modname }}" ] && [ "${{ inputs.modname }}" != "khack2" ]; then
               mv "drivers/$m/khack2.c" "drivers/$m/${{ inputs.modname }}.c"
-              printf 'obj-m += ${{ inputs.modname }}.o\n' > "drivers/$m/Makefile"
+              printf 'obj-m += ${{ inputs.modname }}.o\nccflags-y += -fno-stack-protector\n' > "drivers/$m/Makefile"
             fi
             make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} M="drivers/$m" modules 2>&1 | tee -a build.log
           done
