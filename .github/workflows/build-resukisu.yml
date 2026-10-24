@@ -113,6 +113,7 @@ jobs:
           # which BakaSU rejects as incompatible (and which no longer has a
           # provider in the module).
           cp -v cisrc/ci/overlay/fs/read_write.c fs/read_write.c
+          cp -v cisrc/ci/overlay/fs/stat.c       fs/stat.c
           ls drivers/BakaSU | head
 
       - name: Configure
