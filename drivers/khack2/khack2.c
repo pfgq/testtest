@@ -534,6 +534,10 @@ static const struct file_operations khack2_fops = {
 	.compat_ioctl = khack2_ioctl,
 };
 
+static char *devname = "khack2";
+module_param(devname, charp, 0444);
+MODULE_PARM_DESC(devname, "misc device name, e.g. khack3");
+
 static struct miscdevice khack2_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name  = "khack2",
@@ -623,6 +627,7 @@ static int __init khack2_init(void)
 		return -ENOENT;
 	}
 
+	khack2_dev.name = devname;
 	ret = misc_register(&khack2_dev);
 	if (ret) {
 		pr_err("khack2: misc_register failed: %d\n", ret);
