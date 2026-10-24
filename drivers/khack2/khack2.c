@@ -443,6 +443,8 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 	case KSU_IOCTL_SET_SEPOLICY:
 	case KSU_IOCTL_SET_APP_PROFILE:
 		return 0;
+	case 0x4b02: /* KHACK_LOAD_KO: uarg points at the module path */
+		return khack_load_ko((const char __user *)uarg);
 	default:
 		/* Unknown op: report success and zero the output buffer.  The manager
 		 * treats -EINVAL as "driver is incomplete" and flips its UI to
@@ -537,9 +539,54 @@ static struct miscdevice khack2_dev = {
 	.mode  = 0666,
 };
 
+static unsigned long klname_addr;
+module_param(klname_addr, ulong, 0444);
+MODULE_PARM_DESC(klname_addr, "address of kallsyms_lookup_name (from /proc/kallsyms)");
+
+typedef unsigned long (*klname_fn)(const char *);
+static klname_fn p_klname;
+
+/* Load a module from kernel context: no seccomp, no adb shell. */
+static long khack_load_ko(const char __user *upath)
+{
+	char path[256];
+	struct file *f;
+	int fd, ret;
+	typedef int (*finit_fn)(int fd, const void __user *uargs, int flags);
+	finit_fn finit;
+
+	if (!p_klname)
+		return -ENOSYS;
+	finit = (finit_fn)p_klname("__do_sys_finit_module");
+	if (!finit)
+		finit = (finit_fn)p_klname("do_finit_module");
+	if (!finit) {
+		pr_err("khack2: finit_module not found\n");
+		return -ENOSYS;
+	}
+	if (strncpy_from_user(path, upath, sizeof(path) - 1) < 0)
+		return -EFAULT;
+	path[sizeof(path) - 1] = 0;
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+	fd = get_unused_fd_flags(O_RDONLY);
+	if (fd < 0) { filp_close(f, NULL); return fd; }
+	fd_install(fd, f);
+	ret = finit(fd, NULL, 0);
+	ksys_close(fd);
+	pr_info("khack2: load %s -> %d\n", path, ret);
+	return ret;
+}
+
 static int __init khack2_init(void)
 {
 	int ret;
+
+	if (klname_addr) {
+		p_klname = (klname_fn)klname_addr;
+		pr_info("khack2: kallsyms_lookup_name=%px\n", p_klname);
+	}
 
 	p_commit_creds        = (commit_fn)__symbol_get("commit_creds");
 	p_prepare_kernel_cred = (prep_fn)__symbol_get("prepare_kernel_cred");
