@@ -91,19 +91,16 @@ jobs:
       - name: Fetch ReSukiSU kernel module
         run: |
           set -euxo pipefail
-          git clone --depth 1 https://github.com/Baka-SU/BakaSU /tmp/BakaSU
-          rm -rf drivers/kernelsu
-          cp -r /tmp/BakaSU/kernel drivers/kernelsu
-          grep -q 'kernelsu' drivers/Makefile || \
-            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          grep -q 'kernelsu/Kconfig' drivers/Kconfig || \
-            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          # 4.19 vendor kernels are not GKI: manual hook is the only mode that
-          # works here.  Do NOT touch Kconfig here - KSU_MANUAL_HOOK is a
-          # choice value and a `default y` inside the choice breaks kconfig
-          # with "recursive dependency detected".  It is selected below with
-          # scripts/config instead.
-          ls drivers/kernelsu | head
+          # BakaSU's Kbuild refuses to build unless the source sits in a git
+          # checkout: it tests for $(KSU_SRC)/../.git.  So clone the whole
+          # repo under drivers/ instead of copying kernel/ out of it.
+          rm -rf drivers/BakaSU
+          git clone --depth 1 https://github.com/Baka-SU/BakaSU drivers/BakaSU
+          grep -q 'BakaSU/kernel' drivers/Makefile || \
+            echo 'obj-$(CONFIG_KSU) += BakaSU/kernel/' >> drivers/Makefile
+          grep -q 'BakaSU/kernel/Kconfig' drivers/Kconfig || \
+            sed -i '/^endmenu/i source "drivers/BakaSU/kernel/Kconfig"' drivers/Kconfig
+          ls drivers/BakaSU | head
 
       - name: Configure
         run: |
@@ -140,7 +137,7 @@ jobs:
           make -j"$(nproc)" O=out ARCH=arm64 ${TOOL_ARGS} prepare 2>&1 | tail -20
 
           # just the module tree
-          make -j"$(nproc)" O=out ARCH=arm64 ${TOOL_ARGS} M=drivers/kernelsu modules 2>&1 | tail -40
+          make -j"$(nproc)" O=out ARCH=arm64 ${TOOL_ARGS} M=drivers/BakaSU/kernel modules 2>&1 | tail -40
 
       - name: ccache stats
         if: always()
