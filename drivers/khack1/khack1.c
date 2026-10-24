@@ -268,22 +268,6 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 		return;
 	}
 
-	if (nr == 142 /* reboot */ &&
-	    (u32)regs->regs[0] == KSU_INSTALL_MAGIC1 &&
-	    (u32)regs->regs[1] == KSU_INSTALL_MAGIC2) {
-		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
-					    NULL, O_RDWR);
-		if (fd >= 0 && regs->regs[3])
-			p_copy_to_user((void __user *)regs->regs[3], &fd, sizeof(fd));
-		regs->regs[0] = 0;
-		return;
-	}
-	if (nr == 147 /* setresuid */ && mgr_uid > 0 &&
-	    (int)current_uid().val == mgr_uid) {
-		int fd = p_anon_inode_getfd("[ksu_driver]", &ksu_driver_fops,
-					    NULL, O_RDWR);
-		(void)fd;
-	}
 }
 
 static int khack_open(struct inode *inode, struct file *file)
