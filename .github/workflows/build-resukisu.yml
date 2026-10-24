@@ -40,11 +40,42 @@ jobs:
           set -euxo pipefail
           cd /home/runner
           url="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20251111-release/Clang-15.0.7-20251111.tar.gz"
-          wget -q "$url" -O clang.tar.gz
-          mkdir -p zyc-tmp && tar -xzf clang.tar.gz -C zyc-tmp
-          rm -rf "${TOOLCHAIN_DIR}" && mkdir -p "${TOOLCHAIN_DIR}"
-          src="$(find zyc-tmp -maxdepth 2 -type d -name bin | head -n1)"
-          rsync -a "$(dirname "$src")"/ "${TOOLCHAIN_DIR}"/
+          fname="Clang-15.0.7-20251111.tar.gz"
+          wget -q --show-progress "$url" -O "$fname"
+          file "$fname"
+          gzip -t "$fname"
+
+          clang_entry="$(tar -tzf "$fname" | grep -E '(^|/)(bin/clang|bin/clang-[0-9]+|bin/clang\.real)$' | head -n1 || true)"
+          if [ -z "$clang_entry" ]; then
+            echo "ERROR: cannot find clang entry in tar list."
+            tar -tzf "$fname" | head -n 60
+            exit 1
+          fi
+          echo "Found clang entry: $clang_entry"
+
+          rm -rf /home/runner/zyc-tmp
+          mkdir -p /home/runner/zyc-tmp
+          tar -xzf "$fname" -C /home/runner/zyc-tmp
+
+          root_subdir="$(echo "$clang_entry" | sed -E 's#(^|/)?bin/clang([./-].*)?$##')"
+          root_subdir="${root_subdir%/}"
+          if [ -z "$root_subdir" ]; then
+            src_root="/home/runner/zyc-tmp"
+          else
+            src_root="/home/runner/zyc-tmp/$root_subdir"
+          fi
+
+          rm -rf "${TOOLCHAIN_DIR}"
+          mkdir -p "${TOOLCHAIN_DIR}"
+          rsync -a "$src_root"/ "${TOOLCHAIN_DIR}"/
+
+          if [ ! -e "${TOOLCHAIN_BIN}/clang" ]; then
+            alt="$(ls -1 ${TOOLCHAIN_BIN}/clang-* 2>/dev/null | head -n1 || true)"
+            if [ -n "$alt" ]; then
+              ln -sf "$(basename "$alt")" "${TOOLCHAIN_BIN}/clang"
+            fi
+          fi
+
           "${TOOLCHAIN_BIN}/clang" --version
 
       - name: Fetch ReSukiSU kernel module
