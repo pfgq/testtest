@@ -153,9 +153,13 @@ jobs:
             -d CONFIG_KSU_KPROBES_HOOK -d CONFIG_KSU_TRACEPOINT_HOOK
           make -j"$(nproc)" O=out ${VER_ARGS} ${TOOL_ARGS} olddefconfig 2>&1 | tail -5
           make -j"$(nproc)" O=out ${VER_ARGS} ${TOOL_ARGS} prepare 2>&1 | tail -5
-          make -j"$(nproc)" O=out ${VER_ARGS} ${TOOL_ARGS} scripts/selinux/genheaders 2>&1 | tail -5 || true
+          # genheaders is a host program built by `make scripts`; the
+          # directory target above does not exist as a make goal in 4.19.
+          make -j"$(nproc)" O=out ${VER_ARGS} ${TOOL_ARGS} scripts 2>&1 | tail -8
+          GEN="$(find out/scripts -name genheaders -type f | head -n1)"
+          echo "genheaders=$GEN"
           mkdir -p out/security/selinux
-          out/scripts/selinux/genheaders/genheaders out/security/selinux/flask.h out/security/selinux/av_permissions.h
+          "$GEN" out/security/selinux/flask.h out/security/selinux/av_permissions.h
           grep -E '^CONFIG_KSU' out/.config | head -6
 
       - name: Build (module only, no vmlinux)
