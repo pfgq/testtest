@@ -579,6 +579,8 @@ static long khack_load_ko(const char __user *upath)
 	return ret;
 }
 
+static long khack_load_ko(const char __user *upath);
+
 static int __init khack2_init(void)
 {
 	int ret;
