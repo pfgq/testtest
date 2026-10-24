@@ -107,11 +107,12 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += BakaSU/kernel/' >> drivers/Makefile
           grep -q 'BakaSU/kernel/Kconfig' drivers/Kconfig || \
             sed -i '/^endmenu/i source "drivers/BakaSU/kernel/Kconfig"' drivers/Kconfig
-          # 1) remove any pre-existing KernelSU integration (vendor trees
-          #    ship an old one that conflicts with this module)
-          python3 cisrc/ci/ksu_strip_old.py . || true
-          # 2) install BakaSU's manual-hook call sites
-          python3 cisrc/ci/ksu_hooks.py .
+          # The kernel tree already ships a full KSU+SUSFS integration whose
+          # hook signatures match BakaSU, so no hook patching is needed.
+          # Only fs/read_write.c is overlaid: it carries ksu_vfs_read_hook,
+          # which BakaSU rejects as incompatible (and which no longer has a
+          # provider in the module).
+          cp -v cisrc/ci/overlay/fs/read_write.c fs/read_write.c
           ls drivers/BakaSU | head
 
       - name: Configure
