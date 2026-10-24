@@ -18,8 +18,6 @@
  *   msa_addr   address of memstart_addr
  */
 #include <linux/module.h>
-#include <linux/file.h>
-#include <linux/vmalloc.h>
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
@@ -61,8 +59,6 @@ static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
 static copy_fn   p_copy_to_user;
 static copy_fn   p_copy_from_user;
-typedef unsigned long (*klname_fn)(const char *);
-static klname_fn p_kallsyms_lookup_name;
 static anonfd_fn p_anon_inode_getfd;
 static const struct file_operations ksu_driver_fops;
 static long (*p_orig_reboot)(const struct pt_regs *regs);
@@ -541,45 +537,9 @@ static struct miscdevice khack2_dev = {
 	.mode  = 0666,
 };
 
-/* /proc/kallsyms lists every symbol, exported or not, so we can resolve
- * kallsyms_lookup_name itself and use it for everything else. */
-static void khack_resolve_kallsyms(void)
-{
-	struct file *f;
-	char *buf;
-	ssize_t n;
-	char *p, *end;
-	unsigned long addr;
-	char type, name[128];
-
-	f = filp_open("/proc/kallsyms", O_RDONLY, 0);
-	if (IS_ERR(f))
-		return;
-	buf = vmalloc(256 * 1024);
-	if (!buf) { filp_close(f, NULL); return; }
-	n = kernel_read(f, buf, 256 * 1024 - 1, &f->f_pos);
-	filp_close(f, NULL);
-	if (n <= 0) { vfree(buf); return; }
-	buf[n] = 0;
-
-	for (p = buf; p && *p; p = end) {
-		end = strchr(p, '\n');
-		if (end) *end++ = 0;
-		if (sscanf(p, "%lx %c %127s", &addr, &type, name) == 3 &&
-		    !strcmp(name, "kallsyms_lookup_name")) {
-			p_kallsyms_lookup_name = (klname_fn)addr;
-			break;
-		}
-	}
-	vfree(buf);
-	pr_info("khack2: kallsyms_lookup_name=%px\n", p_kallsyms_lookup_name);
-}
-
 static int __init khack2_init(void)
 {
 	int ret;
-
-	khack_resolve_kallsyms();
 
 	p_commit_creds        = (commit_fn)__symbol_get("commit_creds");
 	p_prepare_kernel_cred = (prep_fn)__symbol_get("prepare_kernel_cred");
