@@ -260,13 +260,13 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 		}
 		case 3: { /* CMD_ALLOW_SU */
 			int uid = 0;
-			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+			if (a1 && p_copy_from_user && !p_copy_from_user(&uid, a1, sizeof(uid)))
 				allow_add(uid);
 			break;
 		}
 		case 4: { /* CMD_DENY_SU */
 			int uid = 0;
-			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+			if (a1 && p_copy_from_user && !p_copy_from_user(&uid, a1, sizeof(uid)))
 				allow_del(uid);
 			break;
 		}
