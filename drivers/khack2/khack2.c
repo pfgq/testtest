@@ -560,14 +560,9 @@ static long khack_load_ko(const char __user *upath)
 	pr_err("khack2: load_ko enter, upath=%px klname=%px\n", upath, (void *)p_klname);
 	if (!p_klname)
 		return -ENOSYS;
-	/* arm64 exposes the syscall wrapper, which reads its arguments from
-	 * pt_regs, not the plain (fd, uargs, flags) signature. */
-	/* __arm64_sys_finit_module is only the syscall wrapper; its real body
-	 * lives in __do_sys_finit_module, exposed under the ".descriptor" name
-	 * on this vendor kernel and taking (fd, uargs, flags) directly. */
-	finit = (finit_fn)p_klname("__do_sys_finit_module.descriptor");
+	finit = (finit_fn)p_klname("__do_sys_finit_module");
 	if (!finit)
-		finit = (finit_fn)p_klname("__do_sys_finit_module");
+		finit = (finit_fn)p_klname("do_finit_module");
 	if (!finit) {
 		pr_err("khack2: finit_module not found\n");
 		return -ENOSYS;
