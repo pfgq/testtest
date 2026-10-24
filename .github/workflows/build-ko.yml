@@ -170,14 +170,14 @@ jobs:
 
           # 3) the two modules, resolved against our hand-built symbol table
           #    khack1 = stable root provider, khack2 = KSU uapi shim
-          for m in khack1 khack2; do
+          for m in khack1 khack2 khack_boot; do
             rm -rf "drivers/$m"
             cp -r "${GITHUB_WORKSPACE}/src/drivers/$m" "drivers/$m"
             make -j$(nproc) O="${O}" ${VER_ARGS} ${TOOL_ARGS} M="drivers/$m" modules 2>&1 | tee -a build.log
           done
 
           rm -rf "${O}/khack_staging" && mkdir -p "${O}/khack_staging"
-          find "${O}" -type f -name "*.ko" \( -path "*/drivers/khack1/*" -o -path "*/drivers/khack2/*" \) -print -exec cp -f {} "${O}/khack_staging/" \;
+          find "${O}" -type f -name "*.ko" \( -path "*/drivers/khack1/*" -o -path "*/drivers/khack2/*" -o -path "*/drivers/khack_boot/*" \) -print -exec cp -f {} "${O}/khack_staging/" \;
           find "${O}/khack_staging" -name "*.ko" -exec llvm-strip --strip-debug {} \;
           ccache --show-stats || true
           cp build.log "${GITHUB_WORKSPACE}/build.log"
