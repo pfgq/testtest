@@ -66,7 +66,7 @@ insert("fs/exec.c",
 
 # fs/open.c: do_faccessat() entry
 insert("fs/open.c",
-       r"^static (?:long|int) do_faccessat\(",
+       r"^(?:static\s+)?(?:long|int|asmlinkage\s+long)\s+do_faccessat\(",
        """
 #ifdef CONFIG_KSU
 	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
