@@ -554,23 +554,25 @@ static long khack_load_ko(const char __user *upath)
 	char path[256];
 	struct file *f;
 	int fd, ret;
-	typedef int (*finit_fn)(int fd, const void __user *uargs, int flags);
-	finit_fn finit;
+	typedef long (*sysfn_t)(const struct pt_regs *regs);
+	sysfn_t sysfn;
+	struct pt_regs regs;
 
 	pr_err("khack2: load_ko enter, upath=%px klname=%px\n", upath, (void *)p_klname);
 	if (!p_klname)
 		return -ENOSYS;
-	finit = (finit_fn)p_klname("__do_sys_finit_module");
-	if (!finit)
-		finit = (finit_fn)p_klname("do_finit_module");
-	if (!finit) {
-		pr_err("khack2: finit_module not found\n");
+	/* Only the arm64 syscall wrapper is in kallsyms: it takes pt_regs and
+	 * forwards regs[0..2] to __do_sys_finit_module.  sp must be a real stack
+	 * pointer, otherwise the wrapper's tracing path faults. */
+	sysfn = (sysfn_t)p_klname("__arm64_sys_finit_module");
+	if (!sysfn) {
+		pr_err("khack2: __arm64_sys_finit_module not found\n");
 		return -ENOSYS;
 	}
 	{
 		long n = strncpy_from_user(path, upath, sizeof(path) - 1);
 		if (n < 0) { pr_err("khack2: strncpy_from_user=%ld\n", n); return -EFAULT; }
-		pr_err("khack2: path='%s' finit=%px\n", path, (void *)finit);
+		pr_err("khack2: path='%s' sysfn=%px\n", path, (void *)sysfn);
 	}
 	path[sizeof(path) - 1] = 0;
 	f = filp_open(path, O_RDONLY, 0);
@@ -581,7 +583,12 @@ static long khack_load_ko(const char __user *upath)
 	fd = get_unused_fd_flags(O_RDONLY);
 	if (fd < 0) { filp_close(f, NULL); return fd; }
 	fd_install(fd, f);
-	ret = finit(fd, NULL, 0);
+	memset(&regs, 0, sizeof(regs));
+	regs.regs[0] = fd;
+	regs.regs[1] = 0;
+	regs.regs[2] = 0;
+	regs.sp = (unsigned long)__builtin_frame_address(0);
+	ret = (int)sysfn(&regs);
 	{
 		void (*p_ksys_close)(unsigned int) =
 			(void (*)(unsigned int))p_klname("ksys_close");
