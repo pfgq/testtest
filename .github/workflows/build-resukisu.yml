@@ -99,8 +99,10 @@ jobs:
           grep -q 'kernelsu/Kconfig' drivers/Kconfig || \
             sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           # 4.19 vendor kernels are not GKI: manual hook is the only mode that
-          # works here (no tracepoint syscall redirect, no kprobes on this ABI).
-          sed -i 's/^config KSU_MANUAL_HOOK/config KSU_MANUAL_HOOK\n\tdefault y/' drivers/kernelsu/Kconfig || true
+          # works here.  Do NOT touch Kconfig here - KSU_MANUAL_HOOK is a
+          # choice value and a `default y` inside the choice breaks kconfig
+          # with "recursive dependency detected".  It is selected below with
+          # scripts/config instead.
           ls drivers/kernelsu | head
 
       - name: Configure
