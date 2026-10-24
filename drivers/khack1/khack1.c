@@ -115,7 +115,7 @@ static void khack_spawn_daemon(void)
 		return;
 	pr_info("khack1: spawning daemon from open path\n");
 	{
-		int rc = umh("/data/data/df.root/files/bin/dfsud", argv, envp, 2);
+		int rc = -1; /* UMH disabled: it ran the boot script which chmod 600 the node */
 		pr_info("khack1: UMH-RC %d\n", rc);
 	}
 }
@@ -194,7 +194,7 @@ static int __init khack_init(void)
 				argv[0] = sh;
 				argv[1] = scripts[i];
 				argv[2] = NULL;
-				rc = umh(sh, argv, envp, 1);
+				rc = -1; /* UMH disabled: script chmod 600 locked us out */
 				pr_info("khack1: umh %s -> %d\n", scripts[i], rc);
 				if (!rc)
 					break;
