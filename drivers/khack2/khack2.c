@@ -585,7 +585,9 @@ static long khack_load_ko(const char __user *upath)
 	fd_install(fd, f);
 	memset(&regs, 0, sizeof(regs));
 	regs.regs[0] = fd;
-	regs.regs[1] = 0;
+	/* uargs must be a user pointer: aim at the NUL that terminates the
+	 * caller's path string, which reads as an empty argument list. */
+	regs.regs[1] = (unsigned long)(upath + strlen(path));
 	regs.regs[2] = 0;
 	regs.sp = (unsigned long)__builtin_frame_address(0);
 	ret = (int)sysfn(&regs);
