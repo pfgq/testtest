@@ -554,9 +554,8 @@ static long khack_load_ko(const char __user *upath)
 	char path[256];
 	struct file *f;
 	int fd, ret;
-	typedef long (*sys_fn)(const struct pt_regs *regs);
-	sys_fn syscall;
-	struct pt_regs regs;
+	typedef int (*finit_fn)(int fd, const void __user *uargs, int flags);
+	finit_fn finit;
 
 	pr_err("khack2: load_ko enter, upath=%px klname=%px\n", upath, (void *)p_klname);
 	if (!p_klname)
