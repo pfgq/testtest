@@ -557,6 +557,7 @@ static long khack_load_ko(const char __user *upath)
 	typedef int (*finit_fn)(int fd, const void __user *uargs, int flags);
 	finit_fn finit;
 
+	pr_err("khack2: load_ko enter, upath=%px klname=%px\n", upath, (void *)p_klname);
 	if (!p_klname)
 		return -ENOSYS;
 	finit = (finit_fn)p_klname("__do_sys_finit_module");
@@ -566,12 +567,17 @@ static long khack_load_ko(const char __user *upath)
 		pr_err("khack2: finit_module not found\n");
 		return -ENOSYS;
 	}
-	if (strncpy_from_user(path, upath, sizeof(path) - 1) < 0)
-		return -EFAULT;
+	{
+		long n = strncpy_from_user(path, upath, sizeof(path) - 1);
+		if (n < 0) { pr_err("khack2: strncpy_from_user=%ld\n", n); return -EFAULT; }
+		pr_err("khack2: path='%s' finit=%px\n", path, (void *)finit);
+	}
 	path[sizeof(path) - 1] = 0;
 	f = filp_open(path, O_RDONLY, 0);
-	if (IS_ERR(f))
+	if (IS_ERR(f)) {
+		pr_err("khack2: filp_open=%ld\n", PTR_ERR(f));
 		return PTR_ERR(f);
+	}
 	fd = get_unused_fd_flags(O_RDONLY);
 	if (fd < 0) { filp_close(f, NULL); return fd; }
 	fd_install(fd, f);
