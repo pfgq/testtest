@@ -16,7 +16,6 @@ jobs:
 
     env:
       TZ: Asia/Tokyo
-      CCACHE_DIR: /home/runner/.cache/ccache_mikernel
       TOOLCHAIN_DIR: /home/runner/zyc-clang
       TOOLCHAIN_BIN: /home/runner/zyc-clang/bin
 
@@ -51,7 +50,7 @@ jobs:
       - name: Install dependencies (cached)
         run: |
           set -euxo pipefail
-          PKGS="bc bison ccache flex g++ gcc git gperf libelf-dev libssl-dev lld llvm make ninja-build openssl pahole python3 python3-pip rsync unzip zip zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi curl"
+          PKGS="bc bison flex g++ gcc git gperf libelf-dev libssl-dev lld llvm make ninja-build openssl pahole python3 python3-pip rsync unzip zip zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi curl"
           if [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null | grep -v lock)" ]; then
             sudo apt-get update
           fi
@@ -59,19 +58,6 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends ${PKGS}
           }
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: /home/runner/.cache/ccache_mikernel
-          key: koccache-${{ hashFiles('src/lmi-4.19.113.config') }}
-          restore-keys: |
-            koccache-${{ hashFiles('src/lmi-4.19.113.config') }}-
-
-      - name: ccache setup (after restore, so it applies to the cached dir)
-        run: |
-          ccache --max-size=2G || true
-          ccache --show-stats || true
 
       - name: Cache zyc-clang toolchain
         id: cache-toolchain
@@ -112,7 +98,7 @@ jobs:
           printf '%s\n' '#!/bin/sh' 'for a in "$@"; do case "$a" in --64|-m64|--32) exec /usr/bin/as "$@";; esac; done' 'exec /usr/bin/aarch64-linux-gnu-as "$@"' > "${TOOLCHAIN_BIN}/as"
           chmod +x "${TOOLCHAIN_BIN}/as"
           mkdir -p /home/runner/clangwrap
-          printf '%s\n' '#!/bin/sh' 'exec ccache /home/runner/zyc-clang/bin/clang "$@" -w' > /home/runner/clangwrap/clang
+          printf '%s\n' '#!/bin/sh' 'exec /home/runner/zyc-clang/bin/clang "$@" -w' > /home/runner/clangwrap/clang
           chmod +x /home/runner/clangwrap/clang
           /home/runner/clangwrap/clang --version | head -n1
 
@@ -179,7 +165,6 @@ jobs:
           rm -rf "${O}/khack_staging" && mkdir -p "${O}/khack_staging"
           find "${O}" -type f -name "*.ko" \( -path "*/drivers/khack1/*" -o -path "*/drivers/khack2/*" -o -path "*/drivers/khack_boot/*" -o -path "*/drivers/empty/*" \) -print -exec cp -f {} "${O}/khack_staging/" \;
           find "${O}/khack_staging" -name "*.ko" -exec llvm-strip --strip-debug {} \;
-          ccache --show-stats || true
           cp build.log "${GITHUB_WORKSPACE}/build.log"
 
       - name: Verify CRCs + vermagic
