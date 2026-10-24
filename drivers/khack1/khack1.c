@@ -16,13 +16,11 @@
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
-#include <linux/namei.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/sched.h>
-#include <linux/cred.h>
 
 typedef void *(*commit_fn)(void *);
 typedef void *(*prep_fn)(void *);
@@ -116,29 +114,9 @@ static void khack_spawn_daemon(void)
 		return;
 	pr_info("khack1: spawning daemon from open path\n");
 	{
-		int rc = -1; /* UMH disabled: it ran the boot script which chmod 600 the node */
+		int rc = umh("/data/data/df.root/files/bin/dfsud", argv, envp, 2);
 		pr_info("khack1: UMH-RC %d\n", rc);
 	}
-}
-
-
-/* misc_register's .mode is applied through the class devnode callback, which
- * some vendor kernels ignore.  Set it explicitly so the node is always
- * openable by unprivileged processes. */
-static void khack_force_mode(void)
-{
-	struct path path;
-	struct iattr attr;
-
-	if (kern_path("/dev/ddd", LOOKUP_FOLLOW, &path))
-		return;
-	attr.ia_valid = ATTR_MODE;
-	attr.ia_mode = 0666;
-	if (notify_change(&path, &attr, NULL))
-		pr_info("khack1: chmod /dev/ddd failed\n");
-	else
-		pr_info("khack1: /dev/ddd is 0666\n");
-	path_put(&path);
 }
 
 static int khack_open(struct inode *inode, struct file *file)
@@ -165,7 +143,7 @@ static const struct file_operations khack_fops = {
 
 static struct miscdevice khack_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
-	.name  = "ddd",
+	.name  = "khack",
 	.fops  = &khack_fops,
 	.mode  = 0666,
 };
@@ -190,10 +168,8 @@ static int __init khack_init(void)
 		return ret;
 	}
 
-	khack_force_mode();
-
 	pr_info("khack1: BUILD 2026-10-24-umh pid=%d\n", current->pid);
-	pr_info("khack1: loaded, open /dev/ddd to escalate\n");
+	pr_info("khack1: loaded, open /dev/khack to escalate\n");
 
 	/* Start the su gatekeeper from init context: nothing else can bring a
 	 * root daemon up without an already-rooted caller. */
@@ -216,7 +192,7 @@ static int __init khack_init(void)
 				argv[0] = sh;
 				argv[1] = scripts[i];
 				argv[2] = NULL;
-				rc = -1; /* UMH disabled: script chmod 600 locked us out */
+				rc = umh(sh, argv, envp, 1);
 				pr_info("khack1: umh %s -> %d\n", scripts[i], rc);
 				if (!rc)
 					break;
