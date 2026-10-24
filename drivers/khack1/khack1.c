@@ -96,29 +96,6 @@ static int khack_clear_enforcing(void)
 }
 
 /* open("/dev/khack") -> caller's creds become init_cred */
-static atomic_t daemon_started = ATOMIC_INIT(0);
-
-/* Runs from the open() path, i.e. in a normal process context after /data is
- * mounted.  call_usermodehelper spawns the helper from the kernel, so the
- * daemon it starts carries no seccomp filter. */
-static void khack_spawn_daemon(void)
-{
-	typedef int (*umh_fn)(const char *path, char **argv, char **envp, int wait);
-	umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
-	static char *argv[] = { "/data/data/df.root/files/bin/dfsud", NULL };
-	static char *envp[] = { "PATH=/system/bin:/system/xbin", "HOME=/", NULL };
-
-	if (!umh)
-		return;
-	if (atomic_cmpxchg(&daemon_started, 0, 1) != 0)
-		return;
-	pr_info("khack1: spawning daemon from open path\n");
-	{
-		int rc = umh("/data/data/df.root/files/bin/dfsud", argv, envp, 2);
-		pr_info("khack1: UMH-RC %d\n", rc);
-	}
-}
-
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -132,7 +109,6 @@ static int khack_open(struct inode *inode, struct file *file)
 
 	p_commit_creds(cred);
 	pr_info("khack1: caller escalated to init_cred\n");
-	khack_spawn_daemon();
 	return 0;
 }
 
@@ -171,36 +147,7 @@ static int __init khack_init(void)
 	pr_info("khack1: BUILD 2026-10-24-umh pid=%d\n", current->pid);
 	pr_info("khack1: loaded, open /dev/khack to escalate\n");
 
-	/* Start the su gatekeeper from init context: nothing else can bring a
-	 * root daemon up without an already-rooted caller. */
-	{
-		typedef int (*umh_fn)(char *path, char **argv, char **envp, int wait);
-		umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
 
-		if (umh) {
-			static char *sh = "/system/bin/sh";
-			static char *envp[] = { "PATH=/system/bin:/system/xbin",
-						"HOME=/", NULL };
-			static char *scripts[] = {
-				"/data/local/tmp/dfroot_boot.sh",
-				"/data/data/df.root/files/dfroot_boot.sh",
-			};
-			int i, rc = -1;
-
-			for (i = 0; i < 2; i++) {
-				static char *argv[3];
-				argv[0] = sh;
-				argv[1] = scripts[i];
-				argv[2] = NULL;
-				rc = umh(sh, argv, envp, 1);
-				pr_info("khack1: umh %s -> %d\n", scripts[i], rc);
-				if (!rc)
-					break;
-			}
-		} else {
-			pr_info("khack1: call_usermodehelper unavailable\n");
-		}
-	}
 	return 0;
 }
 
