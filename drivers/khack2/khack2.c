@@ -563,17 +563,17 @@ static long khack_load_ko(const char __user *upath)
 		return -ENOSYS;
 	/* arm64 exposes the syscall wrapper, which reads its arguments from
 	 * pt_regs, not the plain (fd, uargs, flags) signature. */
-	sys_fn syscall = (sys_fn)p_klname("__arm64_sys_finit_module");
-	if (!syscall)
-		syscall = (sys_fn)p_klname("__do_sys_finit_module");
-	if (!syscall) {
+	sys_fn sysfn = (sys_fn)p_klname("__arm64_sys_finit_module");
+	if (!sysfn)
+		sysfn = (sys_fn)p_klname("__do_sys_finit_module");
+	if (!sysfn) {
 		pr_err("khack2: finit_module not found\n");
 		return -ENOSYS;
 	}
 	{
 		long n = strncpy_from_user(path, upath, sizeof(path) - 1);
 		if (n < 0) { pr_err("khack2: strncpy_from_user=%ld\n", n); return -EFAULT; }
-		pr_err("khack2: path='%s' syscall=%px\n", path, (void *)syscall);
+		pr_err("khack2: path='%s' sysfn=%px\n", path, (void *)sysfn);
 	}
 	path[sizeof(path) - 1] = 0;
 	f = filp_open(path, O_RDONLY, 0);
@@ -588,7 +588,7 @@ static long khack_load_ko(const char __user *upath)
 	regs.regs[0] = fd;
 	regs.regs[1] = 0;
 	regs.regs[2] = 0;
-	ret = (int)syscall(&regs);
+	ret = (int)sysfn(&regs);
 	{
 		void (*p_ksys_close)(unsigned int) =
 			(void (*)(unsigned int))p_klname("ksys_close");
