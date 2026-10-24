@@ -12,6 +12,9 @@
 #include <linux/version.h>
 #include <linux/capability.h>
 
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
@@ -357,6 +360,17 @@ static int hook_func(unsigned long hook_function, int nr,
     return 0;
 }
 
+static long thook_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    return handle_ioctl(0, cmd, arg);
+}
+
+static const struct file_operations thook_fops = {
+    .owner          = THIS_MODULE,
+    .unlocked_ioctl = thook_dev_ioctl,
+    .compat_ioctl   = thook_dev_ioctl,
+};
+
 static int __init my_module_init(void) {
 
     THOOK_LOG("init_page_util...\n");
@@ -370,16 +384,21 @@ static int __init my_module_init(void) {
         return -1;
     }
 
-    #if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 14, 186)
-        THOOK_LOG("hook_func hook_ioctl (__NR_ioctl)...\n");
-        hook_func((unsigned long)hook_ioctl, __NR_ioctl, __sys_call_table);
-    #else
-        // 🔥🔥 必须加上这两行！（保存原始指针，避免炸机）
-        new_original_ioctl = (new_syscall_ioctl_t)__sys_call_table[__NR_ioctl];
-        THOOK_LOG("saved new_original_ioctl = %px\n", new_original_ioctl);
-        THOOK_LOG("hook_func new_hook_ioctl (__NR_ioctl)...\n");
-        hook_func((unsigned long)new_hook_ioctl, __NR_ioctl, __sys_call_table);
-    #endif
+    /* CONFIG_STRICT_KERNEL_RWX keeps sys_call_table read-only and
+     * set_memory_rw() refuses the kernel image range, so patching the table is
+     * not an option here.  Expose the same commands through a misc device. */
+    {
+        static struct miscdevice thook_dev = {
+            .minor = MISC_DYNAMIC_MINOR,
+            .name  = "thook",
+            .fops  = &thook_fops,
+            .mode  = 0666,
+        };
+        int mret = misc_register(&thook_dev);
+        THOOK_LOG("misc_register(/dev/thook) -> %d\n", mret);
+        if (mret)
+            return mret;
+    }
     
     if (!IS_ERR(filp_open("/proc/sched_debug", O_RDONLY, 0))) {
         THOOK_LOG("removing /proc/sched_debug\n");
@@ -391,9 +410,8 @@ static int __init my_module_init(void) {
     }
 
     
-       list_del(&THIS_MODULE->list);
-       kobject_del(&THIS_MODULE->mkobj.kobj);
-       list_del(&THIS_MODULE->mkobj.kobj.entry);
+    /* Keep the module visible so a rebuild can be rmmod'ed instead of
+     * forcing a reboot. */
 
     THOOK_LOG("init finish!\n");
     return 0;
