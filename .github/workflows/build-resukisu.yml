@@ -112,6 +112,12 @@ jobs:
           # Only fs/read_write.c is overlaid: it carries ksu_vfs_read_hook,
           # which BakaSU rejects as incompatible (and which no longer has a
           # provider in the module).
+          # M= builds only see obj-m; BakaSU declares obj-$(CONFIG_KSU)
+          # (=y) so nothing would be built otherwise.
+          sed -i 's/^obj-$(CONFIG_KSU) += kernelsu\.o/obj-m += kernelsu.o/' \
+            drivers/BakaSU/kernel/Kbuild
+          grep -n '^obj-' drivers/BakaSU/kernel/Kbuild
+
           cp -v cisrc/ci/overlay/fs/read_write.c fs/read_write.c
           cp -v cisrc/ci/overlay/fs/stat.c       fs/stat.c
           ls drivers/BakaSU | head
@@ -161,8 +167,8 @@ jobs:
       - name: Collect module
         run: |
           set -euxo pipefail
-          find out -name 'kernelsu.ko' -o -name '*.ko' | grep -i kernelsu || true
-          KO="$(find out -name 'kernelsu.ko' | head -n1)"
+          find . -name 'kernelsu.ko' 2>/dev/null | head -5
+          KO="$(find . -name 'kernelsu.ko' 2>/dev/null | head -n1)"
           cp "$KO" ./kernelsu-4.19.113.ko
           ls -l ./kernelsu-4.19.113.ko
           strings ./kernelsu-4.19.113.ko | grep vermagic
