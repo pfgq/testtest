@@ -141,7 +141,9 @@ jobs:
             -e CONFIG_KSU_MANUAL_HOOK \
             -e CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
             -d CONFIG_KSU_KPROBES_HOOK \
-            -d CONFIG_KSU_TRACEPOINT_HOOK || true
+            -d CONFIG_KSU_TRACEPOINT_HOOK \
+            -d CONFIG_INIT_STACK_ALL_ZERO \
+            -d CONFIG_INIT_STACK_ALL_PATTERN || true
           make O=out ARCH=arm64 olddefconfig
           grep -E 'CONFIG_KSU' out/.config
 
