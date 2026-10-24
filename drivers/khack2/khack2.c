@@ -576,7 +576,14 @@ static long khack_load_ko(const char __user *upath)
 	if (fd < 0) { filp_close(f, NULL); return fd; }
 	fd_install(fd, f);
 	ret = finit(fd, NULL, 0);
-	ksys_close(fd);
+	{
+		void (*p_ksys_close)(unsigned int) =
+			(void (*)(unsigned int))p_klname("ksys_close");
+		if (p_ksys_close)
+			p_ksys_close(fd);
+		/* no fallback: the reference already belongs to the fd table,
+		 * closing it again here would drop it twice. */
+	}
 	pr_info("khack2: load %s -> %d\n", path, ret);
 	return ret;
 }
