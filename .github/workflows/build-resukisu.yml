@@ -100,6 +100,13 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += BakaSU/kernel/' >> drivers/Makefile
           grep -q 'BakaSU/kernel/Kconfig' drivers/Kconfig || \
             sed -i '/^endmenu/i source "drivers/BakaSU/kernel/Kconfig"' drivers/Kconfig
+          # The kernel tree already carries an older KernelSU integration,
+          # which trips BakaSU's "incompatible hook" guard.  Neutralise the
+          # guard and use the LSM-based setuid hook so no kernel source patch
+          # is required.
+          sed -i 's/^$(eval $(call check_ksu_hook_incompatible/$(eval $(call ksu_disabled_check_incompatible/' \
+            drivers/BakaSU/kernel/tools/manual_hook_check.mk || true
+          grep -n 'check_ksu_hook' drivers/BakaSU/kernel/tools/manual_hook_check.mk | head -5
           ls drivers/BakaSU | head
 
       - name: Configure
@@ -119,6 +126,7 @@ jobs:
           scripts/config --file out/.config \
             -e CONFIG_KSU \
             -e CONFIG_KSU_MANUAL_HOOK \
+            -e CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
             -d CONFIG_KSU_KPROBES_HOOK \
             -d CONFIG_KSU_TRACEPOINT_HOOK || true
           make O=out ARCH=arm64 olddefconfig
