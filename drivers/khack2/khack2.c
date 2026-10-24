@@ -18,6 +18,8 @@
  *   msa_addr   address of memstart_addr
  */
 #include <linux/module.h>
+#include <linux/file.h>
+#include <linux/vmalloc.h>
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
