@@ -12,6 +12,8 @@ jobs:
     env:
       TZ: Asia/Tokyo
       TOOLCHAIN_DIR: /home/runner/zyc-clang
+      CCACHE_DIR: /home/runner/.cache/ccache_ksu
+      CCACHE_MAXSIZE: 5G
       TOOLCHAIN_BIN: /home/runner/zyc-clang/bin
       TARGET_DEVICE: lmi
 
@@ -29,11 +31,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex g++ gcc git gperf \
+            bc bison build-essential ccache flex g++ gcc git gperf \
             libelf-dev libssl-dev lld llvm make ninja-build \
             openssl pahole python3 python3-pip rsync unzip zip \
             zlib1g-dev libncurses-dev wget ca-certificates xz-utils zstd \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi curl
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/ccache_ksu
+          key: ccache-ksu-${{ github.sha }}
+          restore-keys: |
+            ccache-ksu-
 
       - name: Get clang toolchain
         run: |
@@ -119,13 +129,19 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${TOOLCHAIN_BIN}:$PATH"
-          make -j"$(nproc)" O=out ARCH=arm64 CC=clang \
+          ccache --max-size=5G
+          ccache --zero-stats
+          make -j"$(nproc)" O=out ARCH=arm64 CC="ccache clang" \
             LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
             OBJDUMP=llvm-objdump STRIP=llvm-strip \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             modules 2>&1 | tail -40
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats || true
 
       - name: Collect module
         run: |
