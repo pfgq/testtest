@@ -318,29 +318,40 @@ asmlinkage long hook_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg)
 static int hook_func(unsigned long hook_function, int nr,
         unsigned long *sys_table)
 {
-    uint64_t orginal_pte;
-    uint64_t *pte;
-    THOOK_LOG("hook_func: hook_function=0x%lx, nr=%d, sys_table=%px\n", hook_function, nr, sys_table);
+    typedef int (*setmem_t)(unsigned long addr, int numpages);
+    setmem_t p_set_rw, p_set_ro;
+    unsigned long page;
+    int ret = 0;
 
-    if(nr<0) {
+    THOOK_LOG("hook_func: hook_function=0x%lx, nr=%d, sys_table=%px\n",
+              hook_function, nr, sys_table);
+
+    if (nr < 0) {
         THOOK_LOG("hook_func: invalid nr=%d\n", nr);
         return 3004;
     }
 
-    pte = pgtable_entry_kernel((uint64_t)&sys_table[nr]);
-    if(pte == NULL) {
-        THOOK_LOG("hook_func: failed to get pte\n");
-        return 3007;
+    /* The vendor kernel is built with CONFIG_STRICT_KERNEL_RWX, so sys_call_table
+     * lives on a read-only page and the old "clear PTE_RDONLY on the direct-map
+     * alias" trick writes to a mapping the CPU never executes from.  Flip the
+     * page permissions through the supported API instead. */
+    p_set_rw = (setmem_t)read_kallsyms("set_memory_rw");
+    p_set_ro = (setmem_t)read_kallsyms("set_memory_ro");
+    if (!p_set_rw || !p_set_ro) {
+        THOOK_LOG("hook_func: set_memory_rw/ro not found\n");
+        return 3008;
     }
 
-    orginal_pte = *pte;
-    *pte = (orginal_pte | PTE_DBM) & ~PTE_RDONLY;
-    flush_tlb_all();
+    page = (unsigned long)&sys_table[nr] & PAGE_MASK;
+    ret = p_set_rw(page, 1);
+    if (ret) {
+        THOOK_LOG("hook_func: set_memory_rw failed %d\n", ret);
+        return ret;
+    }
 
     sys_table[nr] = hook_function;
 
-    *pte = orginal_pte;
-    flush_tlb_all();
+    p_set_ro(page, 1);
 
     THOOK_LOG("hook_func finished\n");
     return 0;
