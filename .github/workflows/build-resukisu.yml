@@ -27,6 +27,13 @@ jobs:
           filter: blob:none
           submodules: false
 
+      - name: Checkout hook patcher
+        uses: actions/checkout@v4
+        with:
+          repository: pfgq/testtest
+          path: cisrc
+          fetch-depth: 1
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -100,13 +107,9 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += BakaSU/kernel/' >> drivers/Makefile
           grep -q 'BakaSU/kernel/Kconfig' drivers/Kconfig || \
             sed -i '/^endmenu/i source "drivers/BakaSU/kernel/Kconfig"' drivers/Kconfig
-          # The kernel tree already carries an older KernelSU integration,
-          # which trips BakaSU's "incompatible hook" guard.  Neutralise the
-          # guard and use the LSM-based setuid hook so no kernel source patch
-          # is required.
-          sed -i 's/^$(eval $(call check_ksu_hook_incompatible/$(eval $(call ksu_disabled_check_incompatible/' \
-            drivers/BakaSU/kernel/tools/manual_hook_check.mk || true
-          grep -n 'check_ksu_hook' drivers/BakaSU/kernel/tools/manual_hook_check.mk | head -5
+          # Apply BakaSU's manual-hook call sites to the kernel sources
+          # (fs/exec.c, fs/open.c, fs/stat.c, kernel/reboot.c).
+          python3 cisrc/ci/ksu_hooks.py .
           ls drivers/BakaSU | head
 
       - name: Configure
