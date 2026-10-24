@@ -127,19 +127,20 @@ jobs:
           make O=out ARCH=arm64 olddefconfig
           grep -E 'CONFIG_KSU' out/.config
 
-      - name: Build
+      - name: Build (module only, no vmlinux)
         run: |
           set -euxo pipefail
           export PATH="${TOOLCHAIN_BIN}:$PATH"
           ccache --max-size=5G
           ccache --zero-stats
-          make -j"$(nproc)" O=out ARCH=arm64 CC="ccache clang" \
-            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            modules 2>&1 | tail -40
+
+          TOOL_ARGS="CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+
+          # prepare only: generates include/generated + scripts, no vmlinux
+          make -j"$(nproc)" O=out ARCH=arm64 ${TOOL_ARGS} prepare 2>&1 | tail -20
+
+          # just the module tree
+          make -j"$(nproc)" O=out ARCH=arm64 ${TOOL_ARGS} M=drivers/kernelsu modules 2>&1 | tail -40
 
       - name: ccache stats
         if: always()
