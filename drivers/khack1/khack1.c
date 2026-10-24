@@ -148,6 +148,9 @@ static struct tracepoint *ksu_find_sys_enter(void *iter_fn)
 	return (struct tracepoint *)f.found;
 }
 #define KSU_PRCTL_OPTION 0xDEADBEEFu
+#ifndef KSU_VERSION
+#define KSU_VERSION 42000
+#endif
 #define KSU_MAX_ALLOW 64
 
 static int allow_uids[KSU_MAX_ALLOW];
@@ -203,7 +206,7 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 
 		switch (cmd) {
 		case 0: { /* CMD_GRANT_ROOT: only for allowed uids */
-			int uid = (int)current_uid().val;
+			int uid = (int)__kuid_val(current_uid());
 			if (allow_has(uid)) {
 				void *cred = p_prepare_kernel_cred(NULL);
 				if (cred)
