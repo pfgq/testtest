@@ -20,6 +20,7 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/vmalloc.h>
+#include <linux/mman.h>
 #include <linux/string.h>
 
 #define ADDR_FILE "/data/local/tmp/kl_addr"
