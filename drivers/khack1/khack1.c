@@ -124,6 +124,9 @@ static struct miscdevice khack_dev = {
 	.mode  = 0666,
 };
 
+static void khack_umh_fn(struct work_struct *w);
+static DECLARE_DELAYED_WORK(khack_umh_work, khack_umh_fn);
+
 static int __init khack_init(void)
 {
 	int ret;
@@ -146,24 +149,29 @@ static int __init khack_init(void)
 
 	pr_info("khack1: loaded, open /dev/khack to escalate\n");
 
-	/* Start the su gatekeeper from init context: nothing else can bring a
-	 * root daemon up without an already-rooted caller. */
-	{
-		typedef int (*umh_fn)(char *path, char **argv, char **envp, int wait);
-		umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
+	/* Kick the boot script off a workqueue: calling call_usermodehelper
+	 * straight from module_init runs in the insmod caller's context, where the
+	 * wait returns -EBUSY and the helper never starts. */
+	schedule_delayed_work(&khack_umh_work, 3 * HZ);
 
-		if (umh) {
-			static char *argv[] = { "/system/bin/sh",
-						"/data/local/tmp/dfroot_boot.sh", NULL };
-			static char *envp[] = { "PATH=/system/bin:/system/xbin",
-						"HOME=/", NULL };
-			umh("/system/bin/sh", argv, envp, 1);
-			pr_info("khack1: started dfroot_boot.sh\n");
-		} else {
-			pr_info("khack1: call_usermodehelper unavailable\n");
-		}
-	}
 	return 0;
+}
+
+static void khack_umh_fn(struct work_struct *w)
+{
+	typedef int (*umh_fn)(char *path, char **argv, char **envp, int wait);
+	umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
+	static char *argv[] = { "/system/bin/sh",
+				"/data/local/tmp/dfroot_boot.sh", NULL };
+	static char *envp[] = { "PATH=/system/bin:/system/xbin", "HOME=/", NULL };
+	int rc;
+
+	if (!umh) {
+		pr_info("khack1: call_usermodehelper unavailable\n");
+		return;
+	}
+	rc = umh("/system/bin/sh", argv, envp, 1);
+	pr_info("khack1: umh %s -> %d\n", argv[1], rc);
 }
 
 static void __exit khack_exit(void)
