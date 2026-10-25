@@ -24,6 +24,7 @@
 
 #define ADDR_FILE "/data/local/tmp/kl_addr"
 #define PATH_FILE "/data/local/tmp/kl_path"
+#define ARGS_FILE "/data/local/tmp/kl_args"
 
 typedef unsigned long (*klname_fn)(const char *);
 typedef int (*finit_fn)(int fd, const void __user *uargs, int flags);
@@ -95,7 +96,29 @@ static int __init khack_boot_init(void)
 		return fd;
 	}
 	fd_install(fd, f);
-	ret = finit(fd, NULL, 0);
+	/* Module parameters come from ARGS_FILE: finit_module needs a user
+	 * pointer, so the string is copied into a user-space mapping first. */
+	{
+		char args[256];
+		void __user *uargs = NULL;
+
+		if (read_small(ARGS_FILE, args, sizeof(args)) > 0) {
+			uargs = (void __user *)vm_mmap(NULL, 0, PAGE_SIZE,
+						       PROT_READ | PROT_WRITE,
+						       MAP_PRIVATE | MAP_ANONYMOUS, 0);
+			if (!IS_ERR((void *)uargs)) {
+				if (copy_to_user(uargs, args, strlen(args) + 1)) {
+					vm_munmap((unsigned long)uargs, PAGE_SIZE);
+					uargs = NULL;
+				}
+			} else {
+				uargs = NULL;
+			}
+		}
+		ret = finit(fd, uargs, 0);
+		if (uargs)
+			vm_munmap((unsigned long)uargs, PAGE_SIZE);
+	}
 	ksys_close(fd);
 
 	pr_info("khack_boot: %s -> %d\n", path, ret);
