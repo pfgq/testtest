@@ -607,9 +607,37 @@ static long khack_load_ko(const char __user *upath)
 	return ret;
 }
 
+/* Read a small text file; used when the loader cannot pass module params. */
+static int read_small(const char *path, char *buf, int size)
+{
+	struct file *f;
+	ssize_t n;
+
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+	n = kernel_read(f, buf, size - 1, &f->f_pos);
+	filp_close(f, NULL);
+	if (n <= 0)
+		return n < 0 ? (int)n : -EINVAL;
+	buf[n] = 0;
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+		buf[--n] = 0;
+	return (int)n;
+}
+
 static int __init khack2_init(void)
 {
 	int ret;
+
+	/* khack_boot loads us without parameters, so fall back to the file that
+	 * userspace prepares with kallsyms_lookup_name's address. */
+	if (!klname_addr) {
+		char tmp[32];
+
+		if (read_small("/data/local/tmp/kl_addr", tmp, sizeof(tmp)) > 0)
+			klname_addr = simple_strtoul(tmp, NULL, 0);
+	}
 
 	if (klname_addr) {
 		p_klname = (klname_fn)klname_addr;
