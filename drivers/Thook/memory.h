@@ -150,65 +150,35 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
 
 bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size)
 {
-	struct task_struct* task;
-	struct mm_struct* mm;
-	phys_addr_t pa;
-	size_t max;
-	size_t count = 0;
+	struct task_struct *task;
+	int copied;
+
+	if (!buffer || !size || addr + size < addr)
+		return false;
 
 	task = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if (!task) {
+	if (!task)
 		return false;
-	}
-	mm = get_task_mm(task);
-	if (!mm) {
-		return false;
-	}
-	while (size > 0) {
-		pa = translate_linear_address(mm, addr);
-		max = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
-		if (!pa) {
-			goto none_phy_addr;
-		}
-		//printk("[*] physical_address = %lx",pa);
-		count = read_physical_address(pa, buffer, max);
-	none_phy_addr:
-		size -= max;
-		buffer += max;
-		addr += max;
-	}
-	mmput(mm);
-	return count;
+
+	/* access_process_vm walks the target's page tables, faults pages in when
+	 * needed and refuses to touch anything that is not mapped, so a bad
+	 * address returns a short count instead of corrupting the kernel. */
+	copied = access_process_vm(task, addr, buffer, size, FOLL_FORCE);
+	return copied == (int)size;
 }
 
 bool write_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size)
 {
-	struct task_struct* task;
-	struct mm_struct* mm;
-	phys_addr_t pa;
-	size_t max;
-	size_t count = 0;
+	struct task_struct *task;
+	int copied;
+
+	if (!buffer || !size || addr + size < addr)
+		return false;
 
 	task = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if (!task) {
+	if (!task)
 		return false;
-	}
-	mm = get_task_mm(task);
-	if (!mm) {
-		return false;
-	}
-	while (size > 0) {
-		pa = translate_linear_address(mm, addr);
-		max = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
-		if (!pa) {
-			goto none_phy_addr;
-		}
-		count = write_physical_address(pa,buffer,max);
-	none_phy_addr:
-		size -= max;
-		buffer += max;
-		addr += max;
-	}
-	mmput(mm);
-	return count;
+
+	copied = access_process_vm(task, addr, buffer, size, FOLL_FORCE | FOLL_WRITE);
+	return copied == (int)size;
 }
