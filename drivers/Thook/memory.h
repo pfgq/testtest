@@ -148,37 +148,60 @@ size_t write_physical_address(phys_addr_t pa, void* buffer, size_t size) {
 	return size;
 }
 
-bool read_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size)
+bool read_process_memory(pid_t pid, uintptr_t addr, void* ubuf, size_t size)
 {
 	struct task_struct *task;
+	void *kbuf;
 	int copied;
+	bool ok = false;
 
-	if (!buffer || !size || addr + size < addr)
+	if (!ubuf || !size || size > 0x100000 || addr + size < addr)
 		return false;
 
 	task = pid_task(find_vpid(pid), PIDTYPE_PID);
 	if (!task)
 		return false;
 
-	/* access_process_vm walks the target's page tables, faults pages in when
-	 * needed and refuses to touch anything that is not mapped, so a bad
-	 * address returns a short count instead of corrupting the kernel. */
-	copied = access_process_vm(task, addr, buffer, size, FOLL_FORCE);
-	return copied == (int)size;
+	/* access_process_vm wants a *kernel* destination, never a user pointer. */
+	kbuf = kmalloc(size, GFP_KERNEL);
+	if (!kbuf)
+		return false;
+
+	copied = access_process_vm(task, addr, kbuf, size, FOLL_FORCE);
+	if (copied == (int)size)
+		ok = copy_to_user(ubuf, kbuf, size) == 0;
+
+	kfree(kbuf);
+	return ok;
 }
 
-bool write_process_memory(pid_t pid, uintptr_t addr, void* buffer, size_t size)
+bool write_process_memory(pid_t pid, uintptr_t addr, void* ubuf, size_t size)
 {
 	struct task_struct *task;
+	void *kbuf;
 	int copied;
+	bool ok = false;
 
-	if (!buffer || !size || addr + size < addr)
+	if (!ubuf || !size || size > 0x100000 || addr + size < addr)
 		return false;
 
 	task = pid_task(find_vpid(pid), PIDTYPE_PID);
 	if (!task)
 		return false;
 
-	copied = access_process_vm(task, addr, buffer, size, FOLL_FORCE | FOLL_WRITE);
-	return copied == (int)size;
+	kbuf = kmalloc(size, GFP_KERNEL);
+	if (!kbuf)
+		return false;
+	if (copy_from_user(kbuf, ubuf, size)) {
+		kfree(kbuf);
+		return false;
+	}
+
+	copied = access_process_vm(task, addr, kbuf, size, FOLL_FORCE | FOLL_WRITE);
+	if (copied == (int)size)
+		ok = true;
+
+	kfree(kbuf);
+	return ok;
 }
+
