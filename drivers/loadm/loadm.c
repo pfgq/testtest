@@ -28,6 +28,27 @@ MODULE_PARM_DESC(klname_addr, "address of kallsyms_lookup_name");
 
 static klname_fn p_klname;
 
+/* The loader that inserts this module passes no parameters, so fall back to
+ * the file userspace prepares with the resolved address. */
+static unsigned long read_addr_file(void)
+{
+	struct file *f;
+	char buf[32];
+	ssize_t n;
+	unsigned long v = 0;
+
+	f = filp_open("/data/local/tmp/kl_addr", O_RDONLY, 0);
+	if (IS_ERR(f))
+		return 0;
+	n = kernel_read(f, buf, sizeof(buf) - 1, &f->f_pos);
+	filp_close(f, NULL);
+	if (n > 0) {
+		buf[n] = 0;
+		v = simple_strtoul(buf, NULL, 0);
+	}
+	return v;
+}
+
 static int load_module_path(const char __user *upath)
 {
 	char path[256];
@@ -101,6 +122,9 @@ static struct miscdevice loadm_dev = {
 static int __init loadm_init(void)
 {
 	int ret;
+
+	if (!klname_addr)
+		klname_addr = read_addr_file();
 
 	if (klname_addr) {
 		p_klname = (klname_fn)klname_addr;
