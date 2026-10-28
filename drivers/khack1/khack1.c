@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /* khack1 - stable root provider for 4.19 vendor kernels (MODVERSIONS-safe).
  *
- * Two things only:
  *   1. locate struct selinux_state by scanning the image and clear enforcing
- *   2. /dev/khack: open() gives the caller init_cred (uid 0, kernel SID)
- *
- * No syscall patching, no module parameters, no KernelSU code. Everything
- * here is proven to load and work on 4.19.113-perf-gec90c723c482, so the
- * root path stays available while khack2 is being experimented with.
+ *   2. /dev/khack: open() gives the caller init_cred, but only if its uid is
+ *      listed in /data/local/tmp/dfroot_allow
  *
  * Only module_layout/printk/misc_register/misc_deregister/__symbol_get are
  * imported, and their vendor CRCs are patched in at packaging time.
@@ -16,11 +12,14 @@
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/sched.h>
+#include <linux/cred.h>
+#include <linux/uaccess.h>
 
 typedef void *(*commit_fn)(void *);
 typedef void *(*prep_fn)(void *);
@@ -29,15 +28,31 @@ typedef unsigned long (*copy_fn)(void *to, const void *from, unsigned long n);
 static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
 
-/* ---- locate struct selinux_state without kallsyms_lookup_name ----
- * Layout (SELINUX_DISABLE=n, DEVELOP=y):
- *   +0 disabled(0) +1 enforcing(1) +2 checkreqprot(0) +3 initialized(1)
- *   +4..+15 policycap[8] + android_netlink_route, all 0/1
- *   +16 avc pointer, +24 ss pointer
- * A booted enforcing system has exactly 00 01 00 01 then twelve bytes <= 1
- * and two aligned in-image pointers. Only a single unambiguous hit is acted
- * on; anything else is left alone.
+/* ---- whitelist ------------------------------------------------------ *
+ * No file IO: the manager rewrites this array inside the module image right
+ * before handing it to the chain, so kernel context never has to open
+ * anything (that is what used to fail with untrusted_app creds).
+ * The symbol name survives in .symtab, so the app can find it by parsing
+ * the ELF instead of hardcoding an offset.
  */
+#define KMAX_ALLOW 8
+static int allow_uids[KMAX_ALLOW] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+static int allow_cnt = KMAX_ALLOW;
+module_param_array(allow_uids, int, &allow_cnt, 0444);
+
+static bool uid_allowed(u32 uid)
+{
+	int i;
+
+	if (allow_cnt <= 0)
+		return false;
+	for (i = 0; i < allow_cnt && i < KMAX_ALLOW; i++)
+		if ((u32)allow_uids[i] == uid)
+			return true;
+	return false;
+}
+
+/* ---- locate struct selinux_state without kallsyms_lookup_name ---- */
 static int khack_clear_enforcing(void)
 {
 	copy_fn pkr = (copy_fn)__symbol_get("probe_kernel_read");
@@ -66,7 +81,7 @@ static int khack_clear_enforcing(void)
 
 			if (b[0] || b[1] != 1 || b[2] || b[3] != 1)
 				continue;
-			if ((a + i) & 7)     /* struct selinux_state holds pointers */
+			if ((a + i) & 7)
 				continue;
 			for (j = 4; j < 16; j++)
 				if (b[j] > 1) { ok = 0; break; }
@@ -85,20 +100,20 @@ static int khack_clear_enforcing(void)
 		}
 	}
 
-	if (found != 1) {
-		pr_info("khack1: selinux_state scan found %d candidates\n", found);
+	if (found != 1)
 		return -ENOENT;
-	}
 
 	*(u8 *)(hit + 1) = 0;
-	pr_info("khack1: selinux_state at %px, enforcement cleared\n", (void *)hit);
 	return 0;
 }
 
-/* open("/dev/khack") -> caller's creds become init_cred */
+/* open("/dev/khack") -> whitelisted caller becomes init_cred */
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
+
+	if (!uid_allowed(__kuid_val(current_uid())))
+		return -EACCES;
 
 	if (!p_prepare_kernel_cred || !p_commit_creds)
 		return -ENOENT;
@@ -108,7 +123,6 @@ static int khack_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	p_commit_creds(cred);
-	pr_info("khack1: caller escalated to init_cred\n");
 	return 0;
 }
 
@@ -124,48 +138,23 @@ static struct miscdevice khack_dev = {
 	.mode  = 0666,
 };
 
-static void khack_umh_fn(struct work_struct *w);
-static DECLARE_DELAYED_WORK(khack_umh_work, khack_umh_fn);
-
 static int __init khack_init(void)
 {
 	int ret;
 
 	p_commit_creds        = (commit_fn)__symbol_get("commit_creds");
 	p_prepare_kernel_cred = (prep_fn)__symbol_get("prepare_kernel_cred");
-	if (!p_commit_creds || !p_prepare_kernel_cred) {
-		pr_err("khack1: __symbol_get failed (%px %px)\n",
-		       p_commit_creds, p_prepare_kernel_cred);
+	if (!p_commit_creds || !p_prepare_kernel_cred)
 		return -ENOENT;
-	}
 
 	khack_clear_enforcing();
 
 	ret = misc_register(&khack_dev);
-	if (ret) {
-		pr_err("khack1: misc_register failed: %d\n", ret);
+	if (ret)
 		return ret;
-	}
 
-	
-
-	/* Kick the boot script off a workqueue: calling call_usermodehelper
-	 * straight from module_init runs in the insmod caller's context, where the
-	 * wait returns -EBUSY and the helper never starts. */
-	schedule_delayed_work(&khack_umh_work, 3 * HZ);
-
+	pr_info("khack1: ready\n");
 	return 0;
-}
-
-static void khack_umh_fn(struct work_struct *w)
-{
-	typedef int (*umh_fn)(char *path, char **argv, char **envp, int wait);
-	umh_fn umh = (umh_fn)__symbol_get("call_usermodehelper");
-	static char *argv[] = { "/system/bin/sh",
-				"/data/local/tmp/dfroot_boot.sh", NULL };
-	static char *envp[] = { "PATH=/system/bin:/system/xbin", "HOME=/", NULL };
-	if (umh)
-		umh("/system/bin/sh", argv, envp, 1);
 }
 
 static void __exit khack_exit(void)
@@ -177,4 +166,3 @@ module_init(khack_init);
 module_exit(khack_exit);
 
 MODULE_LICENSE("GPL");
-
