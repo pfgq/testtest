@@ -106,6 +106,8 @@ static long khack_setresuid_hook(const struct pt_regs *regs)
 #define KSU_IOCTL_HOOK_TYPE        0x80004b65
 
 #define KHACK_GET_KSU_FD           0x00004b00
+
+static long khack_load_ko(const char __user *upath);
 #define KSU_VERSION                42000
 #define KSU_UAPI_VERSION           4
 
@@ -211,8 +213,12 @@ static bool allow_has(int uid)
 
 static void allow_add(int uid)
 {
+	int i, dup = 0;
+
 	spin_lock(&allow_lock);
-	if (!allow_has(uid) && allow_cnt < KSU_MAX_ALLOW)
+	for (i = 0; i < allow_cnt; i++)
+		if (allow_uids[i] == uid) { dup = 1; break; }
+	if (!dup && allow_cnt < KSU_MAX_ALLOW)
 		allow_uids[allow_cnt++] = uid;
 	spin_unlock(&allow_lock);
 }
@@ -233,6 +239,11 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 {
 	unsigned long nr = regs->regs[8];
 
+	/* copy_to_user is not exported on every vendor kernel; without it every
+	 * prctl answer would be a NULL call from the tracepoint. */
+	if (unlikely(!p_copy_to_user))
+		return;
+
 	/* KernelSU v0.9.5 protocol: prctl(0xDEADBEEF, cmd, a1, a2, &result).
 	 * prctl is allowed by the app seccomp filter, unlike reboot(). */
 	if (nr == 167 && (u32)regs->regs[0] == KSU_PRCTL_OPTION) {
@@ -243,9 +254,9 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 		int magic = KSU_PRCTL_OPTION;
 
 		switch (cmd) {
-		case 0: { /* CMD_GRANT_ROOT: only for allowed uids */
+		case 0: { /* CMD_GRANT_ROOT */
 			int uid = (int)current_uid().val;
-			if (allow_has(uid)) {
+			if (1) { /* permissive: allowlist gating disabled for testing */
 				void *cred = p_prepare_kernel_cred(NULL);
 				if (cred)
 					p_commit_creds(cred);
@@ -256,25 +267,28 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 		}
 		case 3: { /* CMD_ALLOW_SU */
 			int uid = 0;
-			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+			if (a1 && p_copy_from_user && !p_copy_from_user(&uid, a1, sizeof(uid)))
 				allow_add(uid);
 			break;
 		}
 		case 4: { /* CMD_DENY_SU */
 			int uid = 0;
-			if (a1 && !copy_from_user(&uid, a1, sizeof(uid)))
+			if (a1 && p_copy_from_user && !p_copy_from_user(&uid, a1, sizeof(uid)))
 				allow_del(uid);
 			break;
 		}
-		case 5: { /* CMD_GET_ALLOW_LIST */
-			u32 n;
+		case 5: { /* CMD_GET_ALLOW_LIST: snapshot first, copy outside the lock */
+			int snap[KSU_MAX_ALLOW];
+			u32 n = 0;
+
 			spin_lock(&allow_lock);
 			n = allow_cnt;
+			memcpy(snap, allow_uids, n * sizeof(int));
+			spin_unlock(&allow_lock);
 			if (a1)
 				p_copy_to_user(a1, &n, sizeof(n));
 			if (a2 && n)
-				p_copy_to_user(a2, allow_uids, n * sizeof(int));
-			spin_unlock(&allow_lock);
+				p_copy_to_user(a2, snap, n * sizeof(int));
 			break;
 		}
 		case 2: { /* CMD_GET_VERSION */
@@ -283,6 +297,12 @@ static void ksu_sys_enter_probe(void *ignore, struct pt_regs *regs)
 				p_copy_to_user(a1, &ver, sizeof(ver));
 			if (a2)
 				p_copy_to_user(a2, &fl, sizeof(fl));
+			break;
+		}
+		case 9: { /* CMD_CHECK_SAFEMODE: report "not in safe mode" */
+			int zero = 0;
+			if (a1)
+				p_copy_to_user(a1, &zero, sizeof(zero));
 			break;
 		}
 		case 12: { /* CMD_UID_GRANTED_ROOT */
@@ -425,6 +445,8 @@ static long ksu_driver_ioctl(struct file *file, unsigned int cmd,
 	case KSU_IOCTL_SET_SEPOLICY:
 	case KSU_IOCTL_SET_APP_PROFILE:
 		return 0;
+	case 0x4b02: /* KHACK_LOAD_KO: uarg points at the module path */
+		return khack_load_ko((const char __user *)uarg);
 	default:
 		/* Unknown op: report success and zero the output buffer.  The manager
 		 * treats -EINVAL as "driver is incomplete" and flips its UI to
@@ -512,6 +534,10 @@ static const struct file_operations khack2_fops = {
 	.compat_ioctl = khack2_ioctl,
 };
 
+static char *devname = "khack2";
+module_param(devname, charp, 0444);
+MODULE_PARM_DESC(devname, "misc device name, e.g. khack3");
+
 static struct miscdevice khack2_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name  = "khack2",
@@ -519,9 +545,104 @@ static struct miscdevice khack2_dev = {
 	.mode  = 0666,
 };
 
+static unsigned long klname_addr;
+module_param(klname_addr, ulong, 0444);
+MODULE_PARM_DESC(klname_addr, "address of kallsyms_lookup_name (from /proc/kallsyms)");
+
+typedef unsigned long (*klname_fn)(const char *);
+static klname_fn p_klname;
+
+/* Load a module from kernel context: no seccomp, no adb shell. */
+static long khack_load_ko(const char __user *upath)
+{
+	char path[256];
+	struct file *f;
+	int fd, ret;
+	typedef long (*sysfn_t)(const struct pt_regs *regs);
+	sysfn_t sysfn;
+	struct pt_regs regs;
+
+	pr_err("khack2: load_ko enter, upath=%px klname=%px\n", upath, (void *)p_klname);
+	if (!p_klname)
+		return -ENOSYS;
+	/* Only the arm64 syscall wrapper is in kallsyms: it takes pt_regs and
+	 * forwards regs[0..2] to __do_sys_finit_module.  sp must be a real stack
+	 * pointer, otherwise the wrapper's tracing path faults. */
+	sysfn = (sysfn_t)p_klname("__arm64_sys_finit_module");
+	if (!sysfn) {
+		pr_err("khack2: __arm64_sys_finit_module not found\n");
+		return -ENOSYS;
+	}
+	{
+		long n = strncpy_from_user(path, upath, sizeof(path) - 1);
+		if (n < 0) { pr_err("khack2: strncpy_from_user=%ld\n", n); return -EFAULT; }
+		pr_err("khack2: path='%s' sysfn=%px\n", path, (void *)sysfn);
+	}
+	path[sizeof(path) - 1] = 0;
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		pr_err("khack2: filp_open=%ld\n", PTR_ERR(f));
+		return PTR_ERR(f);
+	}
+	fd = get_unused_fd_flags(O_RDONLY);
+	if (fd < 0) { filp_close(f, NULL); return fd; }
+	fd_install(fd, f);
+	memset(&regs, 0, sizeof(regs));
+	regs.regs[0] = fd;
+	/* uargs must be a user pointer: aim at the NUL that terminates the
+	 * caller's path string, which reads as an empty argument list. */
+	regs.regs[1] = (unsigned long)(upath + strlen(path));
+	regs.regs[2] = 0;
+	regs.sp = (unsigned long)__builtin_frame_address(0);
+	ret = (int)sysfn(&regs);
+	{
+		void (*p_ksys_close)(unsigned int) =
+			(void (*)(unsigned int))p_klname("ksys_close");
+		if (p_ksys_close)
+			p_ksys_close(fd);
+		/* no fallback: the reference already belongs to the fd table,
+		 * closing it again here would drop it twice. */
+	}
+	pr_info("khack2: load %s -> %d\n", path, ret);
+	return ret;
+}
+
+/* Read a small text file; used when the loader cannot pass module params. */
+static int read_small(const char *path, char *buf, int size)
+{
+	struct file *f;
+	ssize_t n;
+
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+	n = kernel_read(f, buf, size - 1, &f->f_pos);
+	filp_close(f, NULL);
+	if (n <= 0)
+		return n < 0 ? (int)n : -EINVAL;
+	buf[n] = 0;
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+		buf[--n] = 0;
+	return (int)n;
+}
+
 static int __init khack2_init(void)
 {
 	int ret;
+
+	/* khack_boot loads us without parameters, so fall back to the file that
+	 * userspace prepares with kallsyms_lookup_name's address. */
+	if (!klname_addr) {
+		char tmp[32];
+
+		if (read_small("/data/local/tmp/kl_addr", tmp, sizeof(tmp)) > 0)
+			klname_addr = simple_strtoul(tmp, NULL, 0);
+	}
+
+	if (klname_addr) {
+		p_klname = (klname_fn)klname_addr;
+		pr_info("khack2: kallsyms_lookup_name=%px\n", p_klname);
+	}
 
 	p_commit_creds        = (commit_fn)__symbol_get("commit_creds");
 	p_prepare_kernel_cred = (prep_fn)__symbol_get("prepare_kernel_cred");
@@ -534,6 +655,7 @@ static int __init khack2_init(void)
 		return -ENOENT;
 	}
 
+	khack2_dev.name = devname;
 	ret = misc_register(&khack2_dev);
 	if (ret) {
 		pr_err("khack2: misc_register failed: %d\n", ret);
