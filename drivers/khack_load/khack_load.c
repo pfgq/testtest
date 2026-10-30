@@ -19,7 +19,7 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 
-#define DEV_NAME "khack2"
+#define DEV_NAME "khack4"
 
 typedef unsigned long (*klname_fn)(const char *);
 typedef long (*sysfn_fn)(const struct pt_regs *);
@@ -79,7 +79,9 @@ static int do_load(const char __user *upath)
 	memset(&regs, 0, sizeof(regs));
 	regs.regs[0] = fd;
 	regs.regs[1] = (unsigned long)(upath + strlen(path));
-	regs.regs[2] = 0;
+	/* MODULE_INIT_IGNORE_MODVERSIONS: the vendor CRCs cannot be reproduced
+	 * offline, so skip the version check; symbols still bind by name. */
+	regs.regs[2] = 1;
 	regs.sp = (unsigned long)__builtin_frame_address(0);
 	ret = (int)sysfn(&regs);
 

